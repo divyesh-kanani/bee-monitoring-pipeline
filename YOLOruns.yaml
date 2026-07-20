@@ -1,0 +1,10 @@
+# data.yaml
+path: /home/s54dkana/bee_dataset/yolo  # Replace with your actual absolute path
+
+train: images/train
+val: images/valid
+test: images/test
+
+# Classes
+nc: 5
+names: ['bee', 'bumblebee', 'hoverfly', 'other_insect', 'moth']
