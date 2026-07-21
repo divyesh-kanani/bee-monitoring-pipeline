@@ -215,9 +215,9 @@ bee-monitoring-pipeline
 Master's Student – Mobile Robotics  
 University of Bonn
 
-GitHub: [https://github.com/divyesh-kanani](https://github.com/divyesh-kanani)
+GitHub: [link](https://github.com/divyesh-kanani)
 
-LinkedIn: www.linkedin.com/in/divyesh-kanani
+LinkedIn: [link](www.linkedin.com/in/divyesh-kanani)
 
 ---
 
