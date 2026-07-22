@@ -62,6 +62,44 @@ The dataset consists of field recordings containing pollinating insects collecte
 The dataset was manually annotated in YOLO format and further improved using Hard Negative Mining to reduce false positive detections.
 
 ---
+## 🤖 Models
+
+The trained model weights are not included in this repository because they exceed GitHub's file size limit.
+
+You can download the pretrained weights from Google Drive.
+
+| Model | Download |
+|-------|----------|
+| YOLO11x | [Google Drive]([YOUR_GOOGLE_DRIVE_LINK](https://drive.google.com/file/d/1xV4-iaVbs1vrGKcq5Fk-BA2mhyGmiUT8/view?usp=sharing)) |
+| YOLO26x | [Google Drive]([YOUR_GOOGLE_DRIVE_LINK](https://drive.google.com/file/d/1guemxRUqqwk9p6cDBaxCtWghELpJboAN/view?usp=sharing)) |
+| RF-DETR | [Google Drive]([YOUR_GOOGLE_DRIVE_LINK](https://drive.google.com/file/d/1wIGSBCD4cjMfEY9hkn5lLV-aDT988RE1/view?usp=sharing)) |
+
+After downloading, place the weights inside the `models/` directory.
+
+```
+models/
+├── yolov11x.pt
+├── yolov26x.pt
+└── rfdetr_best.pth
+```
+
+---
+
+### Running Inference
+
+Example:
+
+```bash
+python inference.py --weights models/yolov11x.pt --source demo/input.mp4
+```
+
+---
+
+### Notes
+
+- The Google Drive links contain the final trained models.
+- The repository contains all training and inference scripts required to reproduce the results.
+- If you train the models yourself, simply replace the downloaded weights with your own.
 
 ## 🤖 Models Evaluated
 
