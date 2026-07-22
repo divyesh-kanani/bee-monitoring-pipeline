@@ -70,9 +70,9 @@ You can download the pretrained weights from Google Drive.
 
 | Model | Download |
 |-------|----------|
-| YOLO11x | [Google Drive]([YOUR_GOOGLE_DRIVE_LINK](https://drive.google.com/file/d/1xV4-iaVbs1vrGKcq5Fk-BA2mhyGmiUT8/view?usp=sharing)) |
-| YOLO26x | [Google Drive]([YOUR_GOOGLE_DRIVE_LINK](https://drive.google.com/file/d/1guemxRUqqwk9p6cDBaxCtWghELpJboAN/view?usp=sharing)) |
-| RF-DETR | [Google Drive]([YOUR_GOOGLE_DRIVE_LINK](https://drive.google.com/file/d/1wIGSBCD4cjMfEY9hkn5lLV-aDT988RE1/view?usp=sharing)) |
+| YOLO11x | https://drive.google.com/file/d/1xV4-iaVbs1vrGKcq5Fk-BA2mhyGmiUT8/view?usp=sharing |
+| YOLO26x | https://drive.google.com/file/d/1guemxRUqqwk9p6cDBaxCtWghELpJboAN/view?usp=sharing |
+| RF-DETR | https://drive.google.com/file/d/1wIGSBCD4cjMfEY9hkn5lLV-aDT988RE1/view?usp=sharing |
 
 After downloading, place the weights inside the `models/` directory.
 
