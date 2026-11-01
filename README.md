@@ -58,6 +58,7 @@ The dataset consists of field recordings containing pollinating insects collecte
 - Bumblebee
 - Hoverfly
 - Other Insect
+- Moth
 
 The dataset was manually annotated in YOLO format and further improved using Hard Negative Mining to reduce false positive detections.
 
@@ -87,11 +88,57 @@ models/
 
 ### Running Inference
 
-Example:
+Example (run from the project root):
 
 ```bash
-python inference.py --weights models/yolov11x.pt --source demo/input.mp4
+python src/hard_negative_mining.py infer \
+  --weights models/yolo26x.pt \
+  --source videos \
+  --output hard_negative_output
 ```
+
+### Hard-negative review and dataset preparation
+
+The inference command accepts one supported video or a folder of videos. It samples
+frames at a configurable interval, skips near-identical sampled frames, and saves
+only frames with detections. Adjust the confidence, IoU, image-size, and sampling
+settings as needed:
+
+```bash
+python src/hard_negative_mining.py infer \
+  --weights models/yolo26x.pt \
+  --source videos \
+  --output hard_negative_output \
+  --conf 0.25 --iou 0.7 --imgsz 960 --frame-interval 2
+```
+
+Inference creates `review.csv` (one row per candidate frame), `predictions.csv`
+(class, confidence, and pixel bounding boxes), plus `frames/`, `annotated/`, and
+`labels/` folders grouped by video and frame number. Candidates start as
+`unreviewed`; predictions are never automatically marked as false positives.
+Review each annotated frame and its label file, then set `review_status` in
+`review.csv` to `true_positive`, `false_positive`, or `uncertain`. For true
+positives, correct the YOLO label file to include **all** target insects and their
+correct class IDs and boxes. Mark a frame `false_positive` only after verifying
+that it contains no target insects, and clear its label file so it is empty.
+Unreviewed and uncertain frames are excluded from the dataset.
+
+Create a separate reviewed-frame dataset using the class names and IDs from the
+existing YOLO configuration (`config/YOLOruns.yaml`):
+
+```bash
+python src/hard_negative_mining.py prepare \
+  --review-csv hard_negative_output/review.csv \
+  --data config/YOLOruns.yaml \
+  --output hard_negative_dataset
+```
+
+The generated dataset contains `images/{train,val,test}`, matching
+`labels/{train,val,test}`, and a ready-to-use `data.yaml`. At least three reviewed
+videos are required; all frames from a video are assigned to the same split.
+The output is an additive dataset of reviewed frames; the original dataset and
+its annotations are not copied or modified. Outputs are not overwritten, so use
+a new output directory for each run. Training is not started automatically.
 
 ---
 
