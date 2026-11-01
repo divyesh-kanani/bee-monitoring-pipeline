@@ -1,0 +1,30 @@
+# Model weights
+*.pt
+*.pth
+*.onnx
+*.engine
+*.safetensors
+
+# Training outputs
+runs/
+weights/
+checkpoints/
+
+# Datasets
+datasets/
+dataset/
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# Temporary files
+*.log
+.DS_Store
