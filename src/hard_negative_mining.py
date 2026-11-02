@@ -270,11 +270,11 @@ def _read_class_names(data_yaml: Path) -> list[str]:
     return names
 
 
-def _validated_labels(label_path: Path, class_count: int) -> list[str]:
-    if not label_path.is_file():
-        raise FileNotFoundError(f"Candidate label file does not exist: {label_path}")
+def _validate_yolo_lines(
+    source_lines: list[str], class_count: int, label_path: Path | str
+) -> list[str]:
     labels = []
-    for line_number, line in enumerate(label_path.read_text(encoding="utf-8").splitlines(), 1):
+    for line_number, line in enumerate(source_lines, 1):
         fields = line.split()
         if len(fields) != 5:
             raise ValueError(f"Expected five YOLO label values at {label_path}:{line_number}.")
@@ -299,6 +299,14 @@ def _validated_labels(label_path: Path, class_count: int) -> list[str]:
             raise ValueError(f"YOLO box extends outside the image at {label_path}:{line_number}.")
         labels.append(line)
     return labels
+
+
+def _validated_labels(label_path: Path, class_count: int) -> list[str]:
+    if not label_path.is_file():
+        raise FileNotFoundError(f"Candidate label file does not exist: {label_path}")
+    return _validate_yolo_lines(
+        label_path.read_text(encoding="utf-8").splitlines(), class_count, label_path
+    )
 
 
 def _candidate_path(root: Path, relative_path: str) -> Path:

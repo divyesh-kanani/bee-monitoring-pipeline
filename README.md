@@ -86,18 +86,53 @@ models/
 
 ---
 
-### Running Inference
+### Interactive hard-negative review app
 
-Example (run from the project root):
+Install the project dependencies (including Streamlit), then launch the local app
+from the project root:
 
 ```bash
-python src/hard_negative_mining.py infer \
-  --weights models/yolo26x.pt \
-  --source videos \
-  --output hard_negative_output
+pip install -r requirements.txt
+streamlit run src/hard_negative_app.py
 ```
 
-### Hard-negative review and dataset preparation
+The app binds to `127.0.0.1`, disables Streamlit usage telemetry, and permits
+uploads up to 2 GB (`.streamlit/config.toml`). For a remote HPC session, use an
+SSH tunnel to the forwarded local port rather than exposing the app publicly.
+
+Upload your trained `.pt` model and one or more videos. For each video, set the
+start/end times and frames to skip (0 processes every frame; 29 processes every
+30th frame). The app shows video metadata, a sample-count estimate, and preview
+frames before inference. Confidence, IoU, and image size are shared detection
+settings.
+
+Review individual detections, not whole frames: select a box, correct its class
+or pixel coordinates, then keep, reject, or mark it uncertain. Use **Undo
+decision** to restore its previous status. Add missed insects before confirming
+that every target insect in the frame has been annotated. A frame containing an
+unreviewed or uncertain detection, or lacking this whole-frame confirmation, is
+excluded from dataset export. Only accepted boxes are written to labels;
+rejected boxes are omitted, and an empty label is created for a confirmed
+background-only frame.
+
+Download the review CSV at any time. Dataset export creates a ready-to-use YOLO
+ZIP containing `images/{train,val,test}`, `labels/{train,val,test}`, and
+`data.yaml`; an optional separate ZIP contains annotated preview images. All
+frames from one source video stay in one split. At least three videos with
+complete, exportable frames are required to populate train, validation, and test.
+The app never modifies the original dataset or starts training.
+
+Review decisions are saved locally and can be resumed with the same browser
+session URL. Uploaded videos, temporary weights, extracted frames, and exports
+are kept under the ignored `hard_negative_sessions/` directory; set
+`BEE_MINING_DATA_DIR` before launch to choose another local or HPC storage path.
+Media and review data are stored locally by the app. OpenCV uses the video-reported FPS
+for sampling and timestamps; variable-frame-rate video timestamps may therefore
+be approximate.
+
+### Command-line inference (optional)
+
+The original command-line workflow is also available:
 
 The inference command accepts one supported video or a folder of videos. It samples
 frames at a configurable interval, skips near-identical sampled frames, and saves
@@ -106,22 +141,15 @@ settings as needed:
 
 ```bash
 python src/hard_negative_mining.py infer \
-  --weights models/yolo26x.pt \
+  --weights /path/to/your/trained.pt \
   --source videos \
   --output hard_negative_output \
   --conf 0.25 --iou 0.7 --imgsz 960 --frame-interval 2
 ```
 
-Inference creates `review.csv` (one row per candidate frame), `predictions.csv`
-(class, confidence, and pixel bounding boxes), plus `frames/`, `annotated/`, and
-`labels/` folders grouped by video and frame number. Candidates start as
-`unreviewed`; predictions are never automatically marked as false positives.
-Review each annotated frame and its label file, then set `review_status` in
-`review.csv` to `true_positive`, `false_positive`, or `uncertain`. For true
-positives, correct the YOLO label file to include **all** target insects and their
-correct class IDs and boxes. Mark a frame `false_positive` only after verifying
-that it contains no target insects, and clear its label file so it is empty.
-Unreviewed and uncertain frames are excluded from the dataset.
+CLI inference creates `review.csv`, `predictions.csv`, and frames grouped by
+video/frame. The CLI's frame-level review/export commands are separate from the
+interactive app's individual-detection review workflow.
 
 Create a separate reviewed-frame dataset using the class names and IDs from the
 existing YOLO configuration (`config/YOLOruns.yaml`):

@@ -1,0 +1,45 @@
+video,frame,timestamp_seconds,detection_count,image,annotated,label,review_status
+RIMG0006 (1).MOV,60,2.002,4,frames/RIMG0006 (1)/frame_000000060.jpg,annotated/RIMG0006 (1)/frame_000000060.jpg,labels/RIMG0006 (1)/frame_000000060.txt,false_positive
+RIMG0006 (1).MOV,120,4.004,11,frames/RIMG0006 (1)/frame_000000120.jpg,annotated/RIMG0006 (1)/frame_000000120.jpg,labels/RIMG0006 (1)/frame_000000120.txt,false_positive
+RIMG0006 (1).MOV,180,6.006,10,frames/RIMG0006 (1)/frame_000000180.jpg,annotated/RIMG0006 (1)/frame_000000180.jpg,labels/RIMG0006 (1)/frame_000000180.txt,false_positive
+RIMG0006 (1).MOV,480,16.016,8,frames/RIMG0006 (1)/frame_000000480.jpg,annotated/RIMG0006 (1)/frame_000000480.jpg,labels/RIMG0006 (1)/frame_000000480.txt,false_positive
+RIMG0006 (1).MOV,720,24.024,5,frames/RIMG0006 (1)/frame_000000720.jpg,annotated/RIMG0006 (1)/frame_000000720.jpg,labels/RIMG0006 (1)/frame_000000720.txt,false_positive
+RIMG0006 (1).MOV,1020,34.034,8,frames/RIMG0006 (1)/frame_000001020.jpg,annotated/RIMG0006 (1)/frame_000001020.jpg,labels/RIMG0006 (1)/frame_000001020.txt,unreviewed
+RIMG0006 (1).MOV,1080,36.036,6,frames/RIMG0006 (1)/frame_000001080.jpg,annotated/RIMG0006 (1)/frame_000001080.jpg,labels/RIMG0006 (1)/frame_000001080.txt,unreviewed
+RIMG0006 (1).MOV,1140,38.038,13,frames/RIMG0006 (1)/frame_000001140.jpg,annotated/RIMG0006 (1)/frame_000001140.jpg,labels/RIMG0006 (1)/frame_000001140.txt,unreviewed
+RIMG0006 (1).MOV,1200,40.040,10,frames/RIMG0006 (1)/frame_000001200.jpg,annotated/RIMG0006 (1)/frame_000001200.jpg,labels/RIMG0006 (1)/frame_000001200.txt,unreviewed
+RIMG0006 (1).MOV,1260,42.042,6,frames/RIMG0006 (1)/frame_000001260.jpg,annotated/RIMG0006 (1)/frame_000001260.jpg,labels/RIMG0006 (1)/frame_000001260.txt,unreviewed
+RIMG0006 (1).MOV,1320,44.044,8,frames/RIMG0006 (1)/frame_000001320.jpg,annotated/RIMG0006 (1)/frame_000001320.jpg,labels/RIMG0006 (1)/frame_000001320.txt,unreviewed
+RIMG0006 (1).MOV,1380,46.046,11,frames/RIMG0006 (1)/frame_000001380.jpg,annotated/RIMG0006 (1)/frame_000001380.jpg,labels/RIMG0006 (1)/frame_000001380.txt,unreviewed
+RIMG0006 (1).MOV,1440,48.048,8,frames/RIMG0006 (1)/frame_000001440.jpg,annotated/RIMG0006 (1)/frame_000001440.jpg,labels/RIMG0006 (1)/frame_000001440.txt,unreviewed
+RIMG0006 (1).MOV,1620,54.054,7,frames/RIMG0006 (1)/frame_000001620.jpg,annotated/RIMG0006 (1)/frame_000001620.jpg,labels/RIMG0006 (1)/frame_000001620.txt,unreviewed
+RIMG0006 (1).MOV,1680,56.056,6,frames/RIMG0006 (1)/frame_000001680.jpg,annotated/RIMG0006 (1)/frame_000001680.jpg,labels/RIMG0006 (1)/frame_000001680.txt,unreviewed
+RIMG0006 (1).MOV,1920,64.064,7,frames/RIMG0006 (1)/frame_000001920.jpg,annotated/RIMG0006 (1)/frame_000001920.jpg,labels/RIMG0006 (1)/frame_000001920.txt,unreviewed
+RIMG0006 (1).MOV,2460,82.082,7,frames/RIMG0006 (1)/frame_000002460.jpg,annotated/RIMG0006 (1)/frame_000002460.jpg,labels/RIMG0006 (1)/frame_000002460.txt,unreviewed
+RIMG0006 (1).MOV,2580,86.086,12,frames/RIMG0006 (1)/frame_000002580.jpg,annotated/RIMG0006 (1)/frame_000002580.jpg,labels/RIMG0006 (1)/frame_000002580.txt,unreviewed
+RIMG0006 (1).MOV,2640,88.088,7,frames/RIMG0006 (1)/frame_000002640.jpg,annotated/RIMG0006 (1)/frame_000002640.jpg,labels/RIMG0006 (1)/frame_000002640.txt,unreviewed
+RIMG0006 (1).MOV,3120,104.104,12,frames/RIMG0006 (1)/frame_000003120.jpg,annotated/RIMG0006 (1)/frame_000003120.jpg,labels/RIMG0006 (1)/frame_000003120.txt,unreviewed
+RIMG0006 (1).MOV,3180,106.106,2,frames/RIMG0006 (1)/frame_000003180.jpg,annotated/RIMG0006 (1)/frame_000003180.jpg,labels/RIMG0006 (1)/frame_000003180.txt,unreviewed
+RIMG0006.MOV,60,2.002,4,frames/RIMG0006/frame_000000060.jpg,annotated/RIMG0006/frame_000000060.jpg,labels/RIMG0006/frame_000000060.txt,unreviewed
+RIMG0006.MOV,120,4.004,11,frames/RIMG0006/frame_000000120.jpg,annotated/RIMG0006/frame_000000120.jpg,labels/RIMG0006/frame_000000120.txt,unreviewed
+RIMG0006.MOV,180,6.006,10,frames/RIMG0006/frame_000000180.jpg,annotated/RIMG0006/frame_000000180.jpg,labels/RIMG0006/frame_000000180.txt,unreviewed
+RIMG0006.MOV,480,16.016,8,frames/RIMG0006/frame_000000480.jpg,annotated/RIMG0006/frame_000000480.jpg,labels/RIMG0006/frame_000000480.txt,unreviewed
+RIMG0006.MOV,720,24.024,5,frames/RIMG0006/frame_000000720.jpg,annotated/RIMG0006/frame_000000720.jpg,labels/RIMG0006/frame_000000720.txt,unreviewed
+RIMG0006.MOV,1020,34.034,8,frames/RIMG0006/frame_000001020.jpg,annotated/RIMG0006/frame_000001020.jpg,labels/RIMG0006/frame_000001020.txt,unreviewed
+RIMG0006.MOV,1080,36.036,6,frames/RIMG0006/frame_000001080.jpg,annotated/RIMG0006/frame_000001080.jpg,labels/RIMG0006/frame_000001080.txt,unreviewed
+RIMG0006.MOV,1140,38.038,13,frames/RIMG0006/frame_000001140.jpg,annotated/RIMG0006/frame_000001140.jpg,labels/RIMG0006/frame_000001140.txt,unreviewed
+RIMG0006.MOV,1200,40.040,10,frames/RIMG0006/frame_000001200.jpg,annotated/RIMG0006/frame_000001200.jpg,labels/RIMG0006/frame_000001200.txt,unreviewed
+RIMG0006.MOV,1260,42.042,6,frames/RIMG0006/frame_000001260.jpg,annotated/RIMG0006/frame_000001260.jpg,labels/RIMG0006/frame_000001260.txt,unreviewed
+RIMG0006.MOV,1320,44.044,8,frames/RIMG0006/frame_000001320.jpg,annotated/RIMG0006/frame_000001320.jpg,labels/RIMG0006/frame_000001320.txt,unreviewed
+RIMG0006.MOV,1380,46.046,11,frames/RIMG0006/frame_000001380.jpg,annotated/RIMG0006/frame_000001380.jpg,labels/RIMG0006/frame_000001380.txt,unreviewed
+RIMG0006.MOV,1440,48.048,8,frames/RIMG0006/frame_000001440.jpg,annotated/RIMG0006/frame_000001440.jpg,labels/RIMG0006/frame_000001440.txt,unreviewed
+RIMG0006.MOV,1620,54.054,7,frames/RIMG0006/frame_000001620.jpg,annotated/RIMG0006/frame_000001620.jpg,labels/RIMG0006/frame_000001620.txt,unreviewed
+RIMG0006.MOV,1680,56.056,6,frames/RIMG0006/frame_000001680.jpg,annotated/RIMG0006/frame_000001680.jpg,labels/RIMG0006/frame_000001680.txt,unreviewed
+RIMG0006.MOV,1920,64.064,7,frames/RIMG0006/frame_000001920.jpg,annotated/RIMG0006/frame_000001920.jpg,labels/RIMG0006/frame_000001920.txt,unreviewed
+RIMG0006.MOV,2460,82.082,7,frames/RIMG0006/frame_000002460.jpg,annotated/RIMG0006/frame_000002460.jpg,labels/RIMG0006/frame_000002460.txt,unreviewed
+RIMG0006.MOV,2580,86.086,12,frames/RIMG0006/frame_000002580.jpg,annotated/RIMG0006/frame_000002580.jpg,labels/RIMG0006/frame_000002580.txt,unreviewed
+RIMG0006.MOV,2640,88.088,7,frames/RIMG0006/frame_000002640.jpg,annotated/RIMG0006/frame_000002640.jpg,labels/RIMG0006/frame_000002640.txt,unreviewed
+RIMG0006.MOV,3120,104.104,12,frames/RIMG0006/frame_000003120.jpg,annotated/RIMG0006/frame_000003120.jpg,labels/RIMG0006/frame_000003120.txt,unreviewed
+RIMG0006.MOV,3180,106.106,2,frames/RIMG0006/frame_000003180.jpg,annotated/RIMG0006/frame_000003180.jpg,labels/RIMG0006/frame_000003180.txt,unreviewed
+RIMG0047.MOV,60,2.002,1,frames/RIMG0047/frame_000000060.jpg,annotated/RIMG0047/frame_000000060.jpg,labels/RIMG0047/frame_000000060.txt,unreviewed
+RIMG0047.MOV,120,4.004,1,frames/RIMG0047/frame_000000120.jpg,annotated/RIMG0047/frame_000000120.jpg,labels/RIMG0047/frame_000000120.txt,unreviewed
