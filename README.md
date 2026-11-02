@@ -86,19 +86,29 @@ models/
 
 ---
 
-### Interactive hard-negative review app
+### How to run the dashboard
 
-Install the project dependencies (including Streamlit), then launch the local app
-from the project root:
+From the project root, install dependencies and launch the local review dashboard:
 
 ```bash
+cd "/media/data40/vs code/CLG/MORO research/bee-monitoring-pipeline"
+python -m venv .venv
+. .venv/bin/activate
 pip install -r requirements.txt
 streamlit run src/hard_negative_app.py
+```
+
+Then open the local Streamlit URL shown in the terminal, typically:
+
+```text
+http://127.0.0.1:8501
 ```
 
 The app binds to `127.0.0.1`, disables Streamlit usage telemetry, and permits
 uploads up to 2 GB (`.streamlit/config.toml`). For a remote HPC session, use an
 SSH tunnel to the forwarded local port rather than exposing the app publicly.
+
+### Interactive hard-negative review app
 
 Upload your trained `.pt` model and one or more videos. For each video, set the
 start/end times and frames to skip (0 processes every frame; 29 processes every
