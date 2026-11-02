@@ -86,9 +86,7 @@ models/
 
 ---
 
-### How to run the dashboard
-
-From the project root, install dependencies and launch the local review dashboard:
+### Quick start
 
 ```bash
 cd "/media/data40/vs code/CLG/MORO research/bee-monitoring-pipeline"
@@ -98,15 +96,18 @@ pip install -r requirements.txt
 streamlit run src/hard_negative_app.py
 ```
 
-Then open the local Streamlit URL shown in the terminal, typically:
+Open:
 
 ```text
 http://127.0.0.1:8501
 ```
 
-The app binds to `127.0.0.1`, disables Streamlit usage telemetry, and permits
-uploads up to 2 GB (`.streamlit/config.toml`). For a remote HPC session, use an
-SSH tunnel to the forwarded local port rather than exposing the app publicly.
+Then: upload the YOLO `.pt` model and videos, choose the time window and frame skip,
+review each detection, and export the YOLO dataset + CSV.
+
+The app runs locally on `127.0.0.1` and stores session data under
+`hard_negative_sessions/`. For HPC, use an SSH tunnel instead of exposing it
+publicly.
 
 ### Interactive hard-negative review app
 
