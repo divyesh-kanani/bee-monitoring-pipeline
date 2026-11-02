@@ -9,9 +9,15 @@ from pathlib import Path
 from typing import Any
 
 import cv2
+import numpy as np
 import streamlit as st
 import yaml
 from ultralytics import YOLO
+
+try:
+    from rfdetr import RFDETRLarge
+except Exception:  # pragma: no cover - optional dependency for RF-DETR mode
+    RFDETRLarge = None
 
 from hard_negative_mining import DEFAULT_DATA, VIDEO_EXTENSIONS, _read_class_names
 from hard_negative_review import (
@@ -36,6 +42,7 @@ SESSION_ROOT = Path(
     )
 ).expanduser()
 VIDEO_TYPES = sorted(suffix.lstrip(".") for suffix in VIDEO_EXTENSIONS)
+MODEL_BACKENDS = ["Ultralytics YOLO", "RF-DETR"]
 
 
 def _session_id() -> str:
@@ -695,10 +702,337 @@ def _render_export_stage(session_id: str, state: dict[str, Any], data_path: Path
         )
 
 
+def _load_backend_model(model_type: str, weights_path: Path, class_names: list[str]) -> Any:
+    if model_type == "Ultralytics YOLO":
+        model = YOLO(str(weights_path))
+        try:
+            names = list(model.names.values()) if hasattr(model, "names") else class_names
+        except Exception:
+            names = class_names
+        return model, names
+    if model_type == "RF-DETR":
+        if RFDETRLarge is None:
+            raise ValueError("RF-DETR is not available in the current environment.")
+        model = RFDETRLarge.from_checkpoint(str(weights_path))
+        return model, class_names
+    raise ValueError(f"Unsupported model backend: {model_type}")
+
+
+def _extract_common_predictions(raw_predictions: Any, class_names: list[str]) -> list[dict[str, Any]]:
+    detections: list[dict[str, Any]] = []
+    if raw_predictions is None:
+        return detections
+    if hasattr(raw_predictions, "boxes") and raw_predictions.boxes is not None:
+        boxes = raw_predictions.boxes
+        xyxy = getattr(boxes, "xyxy", None)
+        confs = getattr(boxes, "conf", None)
+        class_ids = getattr(boxes, "cls", None)
+        if xyxy is not None and confs is not None and class_ids is not None:
+            xyxy_array = xyxy.cpu().numpy() if hasattr(xyxy, "cpu") else xyxy
+            conf_array = confs.cpu().numpy() if hasattr(confs, "cpu") else confs
+            class_array = class_ids.cpu().numpy() if hasattr(class_ids, "cpu") else class_ids
+            for box, confidence, class_id in zip(xyxy_array, conf_array, class_array):
+                x1, y1, x2, y2 = [float(value) for value in box[:4]]
+                cls_id = int(class_id)
+                detections.append(
+                    {
+                        "class_id": cls_id,
+                        "class_name": class_names[cls_id] if cls_id < len(class_names) else f"class_{cls_id}",
+                        "confidence": float(confidence),
+                        "x1": x1,
+                        "y1": y1,
+                        "x2": x2,
+                        "y2": y2,
+                    }
+                )
+            return detections
+
+    boxes = getattr(raw_predictions, "xyxy", None)
+    if boxes is not None:
+        if hasattr(boxes, "__len__"):
+            for index, box in enumerate(boxes):
+                if len(box) < 4:
+                    continue
+                x1, y1, x2, y2 = [float(value) for value in box[:4]]
+                confidence = float(getattr(raw_predictions, "confidence", [0.0])[index])
+                class_id = int(getattr(raw_predictions, "class_id", [0])[index])
+                detections.append(
+                    {
+                        "class_id": class_id,
+                        "class_name": class_names[class_id] if class_id < len(class_names) else f"class_{class_id}",
+                        "confidence": confidence,
+                        "x1": x1,
+                        "y1": y1,
+                        "x2": x2,
+                        "y2": y2,
+                    }
+                )
+        return detections
+
+    if hasattr(raw_predictions, "data"):
+        data = raw_predictions.data
+        if isinstance(data, dict):
+            keys = list(data.keys())
+            if "xyxy" in keys:
+                boxes = data["xyxy"]
+                confs = data.get("confidence", [0.0] * len(boxes))
+                class_ids = data.get("class_id", list(range(len(boxes))))
+                for index, box in enumerate(boxes):
+                    if len(box) < 4:
+                        continue
+                    x1, y1, x2, y2 = [float(value) for value in box[:4]]
+                    cls_id = int(class_ids[index])
+                    detections.append(
+                        {
+                            "class_id": cls_id,
+                            "class_name": class_names[cls_id] if cls_id < len(class_names) else f"class_{cls_id}",
+                            "confidence": float(confs[index]),
+                            "x1": x1,
+                            "y1": y1,
+                            "x2": x2,
+                            "y2": y2,
+                        }
+                    )
+    return detections
+
+
+def _draw_detection_overlay(frame: np.ndarray, detections: list[dict[str, Any]], class_names: list[str]) -> np.ndarray:
+    annotated = frame.copy()
+    for detection in detections:
+        x1, y1, x2, y2 = [int(round(value)) for value in (detection["x1"], detection["y1"], detection["x2"], detection["y2"])]
+        class_name = detection["class_name"]
+        score = detection["confidence"]
+        cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        label = f"{class_name} {score:.2f}"
+        (text_w, text_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+        cv2.rectangle(annotated, (x1, max(0, y1 - text_h - 8)), (x1 + text_w, y1), (0, 255, 0), -1)
+        cv2.putText(annotated, label, (x1, max(10, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 2)
+    return annotated
+
+
+def _run_detection_backend(
+    model_type: str,
+    weights_path: Path,
+    video_path: Path,
+    class_names: list[str],
+    start_seconds: float,
+    end_seconds: float,
+    frames_to_skip: int,
+    confidence: float,
+    iou: float,
+    image_size: int,
+    progress: Any,
+    stop_key: str,
+) -> tuple[Path, Path]:
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise ValueError(f"Could not open video: {video_path}")
+    metadata = read_video_metadata(video_path)
+    start_frame, end_frame = frame_bounds(
+        start_seconds,
+        end_seconds,
+        metadata["duration"],
+        metadata["fps"],
+        metadata["total_frames"],
+    )
+    sampled_numbers = set(sampled_frame_numbers(start_frame, end_frame, frames_to_skip))
+    output_dir = SESSION_ROOT / "detection_exports" / uuid.uuid4().hex
+    output_dir.mkdir(parents=True, exist_ok=True)
+    title = video_path.stem
+    video_output = output_dir / f"{title}_annotated.mp4"
+    csv_output = output_dir / f"{title}_detections.csv"
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(
+        str(video_output),
+        fourcc,
+        float(metadata["fps"]),
+        (int(metadata["width"]), int(metadata["height"])),
+    )
+    if not writer.isOpened():
+        raise ValueError(f"Could not create output video for {video_path.name}. Check codec support.")
+
+    model, model_names = _load_backend_model(model_type, weights_path, class_names)
+    rows: list[dict[str, Any]] = []
+    frame_counter = start_frame
+    total_selected = len(sampled_numbers)
+    processed = 0
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+    while frame_counter <= end_frame:
+        if st.session_state.get(stop_key, False):
+            writer.release()
+            cap.release()
+            raise RuntimeError("Detection stopped by user.")
+        ok, frame = cap.read()
+        if not ok:
+            break
+        annotated = frame.copy()
+        if frame_counter in sampled_numbers:
+            if model_type == "Ultralytics YOLO":
+                prediction = model(frame, conf=confidence, iou=iou, imgsz=image_size, verbose=False)
+                normalized = []
+                for result in prediction:
+                    normalized.extend(_extract_common_predictions(result, model_names))
+            else:
+                prediction = model.predict(
+                    frame,
+                    threshold=confidence,
+                    shape=(image_size, image_size),
+                    include_source_image=False,
+                )
+                normalized = _extract_common_predictions(prediction, model_names)
+            rows.extend(
+                {
+                    "video": video_path.name,
+                    "frame_number": frame_counter,
+                    "timestamp_seconds": float(frame_counter / metadata["fps"]),
+                    "class_id": item["class_id"],
+                    "class_name": item["class_name"],
+                    "confidence": item["confidence"],
+                    "x1": item["x1"],
+                    "y1": item["y1"],
+                    "x2": item["x2"],
+                    "y2": item["y2"],
+                }
+                for item in normalized
+            )
+            annotated = _draw_detection_overlay(frame, normalized, model_names)
+            processed += 1
+            progress.progress(min(1.0, processed / max(1, total_selected)), text=f"{video_path.name}: {processed}/{total_selected} sampled frames")
+            st.session_state[f"{video_path.name}:preview"] = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
+        writer.write(annotated)
+        frame_counter += 1
+    cap.release()
+    writer.release()
+    if rows:
+        import pandas as pd
+        pd.DataFrame(rows).to_csv(csv_output, index=False)
+    return video_output, csv_output
+
+
+def _render_detection_mode(session_id: str, data_path: Path) -> None:
+    st.header("Detection mode")
+    model_type = st.selectbox("Model type", MODEL_BACKENDS, index=0, key=f"{session_id}:detection_model")
+    if model_type == "RF-DETR" and RFDETRLarge is None:
+        st.warning("RF-DETR is not installed in the current environment, so it cannot be tested here.")
+    weights_file = st.file_uploader("Trained model weights", type=["pt"], key=f"{session_id}:detection_weights")
+    videos = st.file_uploader("Videos", type=VIDEO_TYPES, accept_multiple_files=True, key=f"{session_id}:detection_videos")
+    if not videos:
+        st.info("Upload one or more videos to start detection mode.")
+        return
+
+    conf = st.slider("Confidence threshold", 0.0, 1.0, 0.25, 0.01, key=f"{session_id}:detection_conf")
+    iou = st.slider("IoU threshold", 0.0, 1.0, 0.7, 0.01, key=f"{session_id}:detection_iou")
+    image_size = st.number_input("Image size", min_value=128, max_value=2048, value=960, step=32, key=f"{session_id}:detection_imgsz")
+    skip_frames = st.number_input("Frames to skip between processed frames", min_value=0, max_value=1000, value=29, step=1, key=f"{session_id}:detection_skip")
+    class_names = _read_class_names(data_path)
+    video_settings: dict[str, dict[str, float]] = {}
+    for uploaded in videos:
+        temp_dir = SESSION_ROOT / "detection_preview" / session_id
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        temp_path = temp_dir / uploaded.name
+        temp_path.write_bytes(uploaded.read())
+        metadata = read_video_metadata(temp_path)
+        with st.expander(f"{uploaded.name} settings", expanded=True):
+            start_seconds = st.number_input(
+                f"Start time ({uploaded.name})",
+                min_value=0.0,
+                max_value=float(metadata["duration"]),
+                value=0.0,
+                step=0.1,
+                key=f"{session_id}:start_{uploaded.name}",
+            )
+            end_seconds = st.number_input(
+                f"End time ({uploaded.name})",
+                min_value=0.0,
+                max_value=float(metadata["duration"]),
+                value=float(metadata["duration"]),
+                step=0.1,
+                key=f"{session_id}:end_{uploaded.name}",
+            )
+            if end_seconds <= start_seconds:
+                st.warning("End time must be greater than start time.")
+            video_settings[uploaded.name] = {"start": float(start_seconds), "end": float(end_seconds)}
+    stop_key = f"{session_id}:stop_detection"
+    if "detection_outputs" not in st.session_state:
+        st.session_state["detection_outputs"] = {}
+
+    if st.button("Start detection", type="primary", key=f"{session_id}:start_detection"):
+        if weights_file is None:
+            st.error("Please upload a trained model before starting detection.")
+        else:
+            st.session_state[stop_key] = False
+            st.session_state["detection_outputs"] = {}
+            output_dir = SESSION_ROOT / "detection_exports" / session_id
+            output_dir.mkdir(parents=True, exist_ok=True)
+            weights_path = output_dir / "weights.pt"
+            weights_path.write_bytes(weights_file.getvalue())
+            for uploaded in videos:
+                saved = output_dir / uploaded.name
+                try:
+                    saved.write_bytes(uploaded.getvalue())
+                    if not saved.is_file() or saved.stat().st_size == 0:
+                        raise ValueError(f"Could not save uploaded video: {uploaded.name}")
+                    metadata = read_video_metadata(saved)
+                    settings = video_settings.get(uploaded.name, {"start": 0.0, "end": float(metadata["duration"])})
+                    start_seconds = float(settings.get("start", 0.0))
+                    end_seconds = float(settings.get("end", metadata["duration"]))
+                    if end_seconds <= start_seconds:
+                        raise ValueError("End time must be greater than start time.")
+                    video_out, csv_out = _run_detection_backend(
+                        model_type,
+                        weights_path,
+                        saved,
+                        class_names,
+                        start_seconds,
+                        end_seconds,
+                        int(skip_frames),
+                        float(conf),
+                        float(iou),
+                        int(image_size),
+                        st.progress(0.0, text=f"Scanning {uploaded.name}..."),
+                        stop_key,
+                    )
+                    st.session_state["detection_outputs"][uploaded.name] = {
+                        "video": str(video_out),
+                        "csv": str(csv_out),
+                    }
+                except Exception as error:
+                    st.error(f"{uploaded.name}: {error}")
+                    continue
+
+    if st.button("Stop detection", key=f"{session_id}:stop_detection_button"):
+        st.session_state[stop_key] = True
+
+    outputs = st.session_state.get("detection_outputs", {})
+    if outputs:
+        for name, payload in outputs.items():
+            if Path(payload["video"]).exists():
+                st.subheader(name)
+                st.video(str(payload["video"]))
+                with open(payload["video"], "rb") as handle:
+                    st.download_button(
+                        f"Download annotated MP4 for {name}",
+                        data=handle.read(),
+                        file_name=Path(payload["video"]).name,
+                        mime="video/mp4",
+                        key=f"{session_id}:download_video_{name}",
+                    )
+                if Path(payload["csv"]).exists():
+                    with open(payload["csv"], "r", encoding="utf-8") as handle:
+                        st.download_button(
+                            f"Download detection CSV for {name}",
+                            data=handle.read(),
+                            file_name=Path(payload["csv"]).name,
+                            mime="text/csv",
+                            key=f"{session_id}:download_csv_{name}",
+                        )
+
+
 def main() -> None:
-    st.set_page_config(page_title="Bee hard-negative mining", page_icon="🐝", layout="wide")
-    st.title("🐝 Bee hard-negative mining")
-    st.caption("Run YOLO on field videos, review each detection, and export a checked YOLO dataset.")
+    st.set_page_config(page_title="Bee monitoring dashboard", page_icon="🐝", layout="wide")
+    st.title("🐝 Bee monitoring dashboard")
+    st.caption("Unified detection and hard-negative review for bee monitoring videos.")
+
     session_id = _session_id()
     try:
         state = _load_state(session_id)
@@ -706,6 +1040,13 @@ def main() -> None:
         st.error(str(error))
         st.stop()
 
+    mode = st.radio(
+        "Choose a mode",
+        ["Detection", "Hard-negative mining"],
+        index=1,
+        horizontal=True,
+        key=f"{session_id}:mode",
+    )
     default_data = str(DEFAULT_DATA)
     data_config = st.text_input(
         "YOLO class configuration",
@@ -714,6 +1055,11 @@ def main() -> None:
         key=f"{session_id}:data_config",
     )
     data_path = Path(data_config).expanduser()
+
+    if mode == "Detection":
+        _render_detection_mode(session_id, data_path)
+        return
+
     weights_file = st.file_uploader(
         "Trained YOLO weights (.pt)",
         type=["pt"],
