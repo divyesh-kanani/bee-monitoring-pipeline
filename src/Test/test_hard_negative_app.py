@@ -14,6 +14,24 @@ from src.hard_negative_mining import _read_class_names
 
 
 class HardNegativeAppTests(unittest.TestCase):
+    def test_browser_reload_clears_the_previous_session_directory(self):
+        project_root = Path(__file__).resolve().parents[2]
+        app_file = project_root / "src" / "hard_negative_app.py"
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            session_id = uuid.uuid4().hex
+            session_dir = Path(temporary_directory) / session_id
+            session_dir.mkdir(parents=True)
+            (session_dir / "review.json").write_text("{}", encoding="utf-8")
+
+            with patch.dict(os.environ, {"BEE_MINING_DATA_DIR": temporary_directory}):
+                app = AppTest.from_file(str(app_file))
+                app.query_params["session"] = session_id
+                app.run(timeout=30)
+
+            self.assertFalse(app.exception)
+            self.assertFalse(session_dir.exists())
+            self.assertNotEqual(app.query_params["session"], session_id)
+
     def test_review_ui_selects_and_persists_individual_decisions(self):
         project_root = Path(__file__).resolve().parents[2]
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -81,6 +99,7 @@ class HardNegativeAppTests(unittest.TestCase):
 
             with patch.dict(os.environ, {"BEE_MINING_DATA_DIR": temporary_directory}):
                 app = AppTest.from_file(str(app_file))
+                app.session_state["_bee_dashboard_initialized"] = True
                 app.query_params["session"] = session_id
                 app.run(timeout=30)
                 self.assertFalse(app.exception)

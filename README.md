@@ -102,8 +102,9 @@ Open:
 http://127.0.0.1:8501
 ```
 
-Then: upload the YOLO `.pt` model and videos, choose the time window and frame skip,
-review each detection, and export the YOLO dataset + CSV.
+Choose **Detection** for normal inference or **Hard-negative mining** for annotation
+review. Upload YOLO `.pt` weights or RF-DETR `.pth` weights, then select your videos.
+Detection exports a browser-compatible H.264 MP4 and a prediction CSV.
 
 The app runs locally on `127.0.0.1` and stores session data under
 `hard_negative_sessions/`. For HPC, use an SSH tunnel instead of exposing it
@@ -133,13 +134,12 @@ frames from one source video stay in one split. At least three videos with
 complete, exportable frames are required to populate train, validation, and test.
 The app never modifies the original dataset or starts training.
 
-Review decisions are saved locally and can be resumed with the same browser
-session URL. Uploaded videos, temporary weights, extracted frames, and exports
-are kept under the ignored `hard_negative_sessions/` directory; set
-`BEE_MINING_DATA_DIR` before launch to choose another local or HPC storage path.
-Media and review data are stored locally by the app. OpenCV uses the video-reported FPS
-for sampling and timestamps; variable-frame-rate video timestamps may therefore
-be approximate.
+Uploads, review decisions, and exports are stored locally under the ignored
+`hard_negative_sessions/` directory. Saved app data is deleted when a fresh
+browser session starts; use **Clear session data now** to remove it sooner.
+On shared/HPC storage, set a private `BEE_MINING_DATA_DIR` before launch.
+OpenCV uses the video-reported FPS for sampling and timestamps; variable-frame-rate
+video timestamps may therefore be approximate.
 
 ### Command-line inference (optional)
 
