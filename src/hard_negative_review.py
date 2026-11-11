@@ -126,8 +126,10 @@ def extract_detections(
     end_seconds: float,
     frames_to_skip: int,
     progress: Any = None,
+    metadata: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    metadata = read_video_metadata(video_path)
+    if metadata is None:
+        metadata = read_video_metadata(video_path)
     start_frame, end_frame = frame_bounds(
         start_seconds,
         end_seconds,
@@ -318,7 +320,6 @@ def create_dataset(
         statuses = {detection["status"] for detection in detections}
         if (
             not frame["annotation_complete"]
-            or not detections
             or statuses - {"true_positive", "false_positive"}
         ):
             continue

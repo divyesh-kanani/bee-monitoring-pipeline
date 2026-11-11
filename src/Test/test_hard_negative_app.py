@@ -110,7 +110,7 @@ class HardNegativeAppTests(unittest.TestCase):
             self.assertFalse(session_dir.exists())
             self.assertNotEqual(app.query_params["session"], session_id)
 
-    def test_review_ui_selects_and_persists_individual_decisions(self):
+    def test_batch_review_saves_multiple_decisions_and_navigates_frames(self):
         project_root = Path(__file__).resolve().parents[2]
         with tempfile.TemporaryDirectory() as temporary_directory:
             session_id = uuid.uuid4().hex
@@ -119,6 +119,12 @@ class HardNegativeAppTests(unittest.TestCase):
             image_path.parent.mkdir(parents=True)
             self.assertTrue(
                 cv2.imwrite(str(image_path), np.zeros((64, 64, 3), dtype=np.uint8))
+            )
+            next_image_path = session_dir / "frames" / "frame_000000020.jpg"
+            self.assertTrue(
+                cv2.imwrite(
+                    str(next_image_path), np.full((64, 64, 3), 80, dtype=np.uint8)
+                )
             )
             class_names = _read_class_names(project_root / "config" / "YOLOruns.yaml")
             state = {
@@ -171,6 +177,36 @@ class HardNegativeAppTests(unittest.TestCase):
                     }
                 ],
             }
+            state["frames"].append(
+                {
+                    "frame_id": "video-a_000000020",
+                    "video_id": "video-a",
+                    "video_filename": "field.mp4",
+                    "frame_number": 20,
+                    "timestamp_seconds": 2.0,
+                    "image_path": str(next_image_path),
+                    "width": 64,
+                    "height": 64,
+                    "annotation_complete": False,
+                    "detections": [
+                        {
+                            "detection_id": "video-a_000000020-d001",
+                            "class_id": 0,
+                            "class_name": class_names[0],
+                            "predicted_class_id": 0,
+                            "predicted_class": class_names[0],
+                            "confidence": 0.8,
+                            "x1": 8.0,
+                            "y1": 8.0,
+                            "x2": 40.0,
+                            "y2": 40.0,
+                            "status": "unreviewed",
+                            "manual": False,
+                            "history": [],
+                        }
+                    ],
+                }
+            )
             session_dir.mkdir(parents=True, exist_ok=True)
             (session_dir / "review.json").write_text(json.dumps(state), encoding="utf-8")
             app_file = project_root / "src" / "hard_negative_app.py"
@@ -181,24 +217,15 @@ class HardNegativeAppTests(unittest.TestCase):
                 app.query_params["session"] = session_id
                 app.run(timeout=30)
                 self.assertFalse(app.exception)
-                self.assertTrue(any(button.label == "1 ○" for button in app.button))
-                self.assertTrue(any(button.label == "2 ○" for button in app.button))
+                self.assertTrue(any(button.label == "#1 ○" for button in app.button))
+                self.assertTrue(any(button.label == "#2 ○" for button in app.button))
                 self.assertTrue(
                     any("CSV" in button.label for button in app.download_button)
                 )
                 self.assertTrue(
-                    any(button.label == "Reject detection" for button in app.button)
+                    any(button.label == "Previous unreviewed" for button in app.button)
                 )
-                self.assertTrue(
-                    any(button.label == "Mark uncertain" for button in app.button)
-                )
-                self.assertTrue(
-                    any(button.label == "Undo decision" for button in app.button)
-                )
-                self.assertTrue(
-                    any(button.label == "← Previous" for button in app.button)
-                )
-                self.assertTrue(any(button.label == "Next →" for button in app.button))
+                self.assertTrue(any(button.label == "Next frame →" for button in app.button))
                 self.assertTrue(
                     any(
                         checkbox.label
@@ -206,51 +233,109 @@ class HardNegativeAppTests(unittest.TestCase):
                         for checkbox in app.checkbox
                     )
                 )
-                self.assertTrue(any(button.label == "Save boxes" for button in app.button))
                 self.assertTrue(
-                    any(box.label == "Selected box class" for box in app.selectbox)
+                    any(button.label == "Save Frame & Next" for button in app.button)
                 )
-                self.assertFalse(any(box.label.startswith("Class —") for box in app.selectbox))
+                self.assertFalse(any(button.label == "Save boxes" for button in app.button))
+                self.assertTrue(
+                    any(button.label == "Select all as true positive" for button in app.button)
+                )
+                self.assertTrue(
+                    any(
+                        button.label == "Confirm remaining as true positives"
+                        for button in app.button
+                    )
+                )
+                save_button = next(
+                    button for button in app.button if button.label == "Save Frame & Next"
+                )
+                save_button.click().run(timeout=30)
+                self.assertTrue(
+                    any(
+                        "still unreviewed" in error.value
+                        for error in app.error
+                    )
+                )
+                unreviewed_state = json.loads(
+                    (session_dir / "review.json").read_text(encoding="utf-8")
+                )
+                self.assertTrue(
+                    all(
+                        detection["status"] == "unreviewed"
+                        for detection in unreviewed_state["frames"][0]["detections"]
+                    )
+                )
 
-                keep_button = next(
-                    button for button in app.button if button.label == "Keep detection"
+                next(
+                    button for button in app.button if button.label == "#1 ○"
+                ).click().run(timeout=30)
+                next(
+                    button for button in app.button if button.label == "Mark selected false"
+                ).click().run(timeout=30)
+                self.assertTrue(any(button.label == "#1 ×" for button in app.button))
+                next(
+                    button for button in app.button if button.label == "#2 ○"
+                ).click().run(timeout=30)
+                self.assertEqual(
+                    app.session_state[
+                        f"{session_id}:video-a_000000010:selected_detections"
+                    ],
+                    {
+                        "video-a_000000010-d001",
+                        "video-a_000000010-d002",
+                    },
                 )
-                keep_button.click().run(timeout=30)
+                next(
+                    button for button in app.button if button.label == "Clear selections"
+                ).click().run(timeout=30)
+                self.assertEqual(
+                    app.session_state[
+                        f"{session_id}:video-a_000000010:selected_detections"
+                    ],
+                    set(),
+                )
+                next(
+                    button
+                    for button in app.button
+                    if button.label == "Confirm remaining as true positives"
+                ).click().run(timeout=30)
+                completeness = next(
+                    checkbox
+                    for checkbox in app.checkbox
+                    if checkbox.label
+                    == "I have checked the entire frame; all target insects are annotated."
+                )
+                completeness.set_value(True).run(timeout=30)
+                next(
+                    button for button in app.button if button.label == "Save Frame & Next"
+                ).click().run(timeout=30)
 
                 saved_state = json.loads(
                     (session_dir / "review.json").read_text(encoding="utf-8")
                 )
                 saved_detections = saved_state["frames"][0]["detections"]
-                self.assertEqual(saved_detections[0]["status"], "true_positive")
+                self.assertEqual(saved_detections[0]["status"], "false_positive")
+                self.assertEqual(saved_detections[1]["status"], "true_positive")
                 self.assertEqual(saved_detections[0]["history"], ["unreviewed"])
-                self.assertEqual(saved_detections[1]["status"], "unreviewed")
-                self.assertEqual(len(saved_detections), 2)
+                self.assertTrue(saved_state["frames"][0]["annotation_complete"])
                 self.assertEqual(
-                    app.session_state[
-                        f"{session_id}:video-a_000000010:selected_detection"
-                    ],
-                    "video-a_000000010-d002",
+                    app.session_state[f"{session_id}:current_frame"],
+                    "video-a_000000020",
                 )
-                reject_button = next(
-                    button for button in app.button if button.label == "Reject detection"
-                )
-                reject_button.click().run(timeout=30)
-                saved_state = json.loads(
-                    (session_dir / "review.json").read_text(encoding="utf-8")
-                )
+                next(
+                    button for button in app.button if button.label == "← Previous frame"
+                ).click().run(timeout=30)
                 self.assertEqual(
-                    saved_state["frames"][0]["detections"][1]["status"],
-                    "false_positive",
+                    app.session_state[f"{session_id}:current_frame"],
+                    "video-a_000000010",
                 )
-                delete_button = next(
-                    button for button in app.button if button.label == "Delete box"
+                next(
+                    button for button in app.button if button.label == "Next frame →"
+                ).click().run(timeout=30)
+                self.assertEqual(
+                    app.session_state[f"{session_id}:current_frame"],
+                    "video-a_000000020",
                 )
-                delete_button.click().run(timeout=30)
-                saved_state = json.loads(
-                    (session_dir / "review.json").read_text(encoding="utf-8")
-                )
-                self.assertEqual(len(saved_state["frames"][0]["detections"]), 1)
-                self.assertFalse(saved_state["frames"][0]["annotation_complete"])
 
 
 if __name__ == "__main__":

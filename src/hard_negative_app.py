@@ -4,6 +4,7 @@ import csv
 import colorsys
 import fcntl
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -25,16 +26,13 @@ import streamlit as st
 import yaml
 from PIL import Image
 from streamlit_drawable_canvas import st_canvas
-from ultralytics import YOLO
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-try:
-    from rfdetr import RFDETRLarge
-except Exception:  # pragma: no cover - optional dependency for RF-DETR mode
-    RFDETRLarge = None
+RFDETRLarge = None
+YOLO = None
 
 from hard_negative_mining import DEFAULT_DATA, VIDEO_EXTENSIONS, _read_class_names
 from hard_negative_review import (
@@ -48,11 +46,6 @@ from hard_negative_review import (
     sampled_frame_numbers,
     zip_directory,
 )
-from tracking.detector import Detection
-from tracking.tracker import Tracker as ByteTracker
-from tracking.video_utils import draw_tracks
-
-
 SESSION_ROOT = Path(
     os.environ.get(
         "BEE_MINING_TMPDIR",
@@ -71,6 +64,38 @@ SESSION_CLEANUP_INTERVAL_SECONDS = max(
 )
 VIDEO_TYPES = sorted(suffix.lstrip(".") for suffix in VIDEO_EXTENSIONS)
 MODEL_BACKENDS = ["Ultralytics YOLO", "RF-DETR"]
+
+
+def _rfdetr_available() -> bool:
+    if RFDETRLarge is not None:
+        return True
+    try:
+        return importlib.util.find_spec("rfdetr") is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def _get_rfdetr_class() -> Any:
+    global RFDETRLarge
+    if RFDETRLarge is not None:
+        return RFDETRLarge
+    try:
+        from rfdetr import RFDETRLarge as RFDETRLargeClass
+    except Exception as error:
+        raise ValueError(
+            f"RF-DETR is not available in the current environment: {error}"
+        ) from error
+    RFDETRLarge = RFDETRLargeClass
+    return RFDETRLarge
+
+
+def _get_yolo_class() -> Any:
+    global YOLO
+    if YOLO is None:
+        from ultralytics import YOLO as YOLOClass
+
+        YOLO = YOLOClass
+    return YOLO
 
 
 def _supported_weight_extensions(model_type: str) -> list[str]:
@@ -226,59 +251,233 @@ def _save_state(session_id: str, state: dict[str, Any]) -> None:
 
 
 def _store_upload(
-    session_id: str, uploaded_file: Any, suffix: str, category: str
+    session_id: str,
+    uploaded_file: Any,
+    suffix: str,
+    category: str,
+    upload_cache: dict[str, Any] | None = None,
 ) -> tuple[str, Path]:
-    directory = _session_directory(session_id) / "uploads"
+    directory = _session_directory(session_id) / (
+        "detection_preview" if category == "detection" else "uploads"
+    )
     directory.mkdir(parents=True, exist_ok=True)
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(uploaded_file.name).name)
+    upload_id = getattr(uploaded_file, "file_id", None)
+    cache_key = (
+        f"{session_id}:upload:{category}:{upload_id}" if upload_id is not None else None
+    )
+    cache = st.session_state if upload_cache is None else upload_cache
+    cached = cache.get(cache_key) if cache_key else None
+    if (
+        isinstance(cached, dict)
+        and cached.get("name") == uploaded_file.name
+        and cached.get("size") == uploaded_file.size
+        and cached.get("suffix") == suffix
+        and Path(cached.get("path", "")).is_file()
+    ):
+        return cached["digest"], Path(cached["path"])
+
     contents = uploaded_file.getbuffer()
     digest = hashlib.sha256(contents).hexdigest()
-    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(uploaded_file.name).name)
-    path = (
-        directory / f"{digest}{suffix}"
-        if category == "weights"
-        else directory / f"{digest[:12]}_{safe_name}"
-    )
+    if category == "weights":
+        path = directory / f"{digest}{suffix}"
+    elif category == "detection":
+        path = directory / f"{digest[:12]}_{safe_name}"
+    else:
+        path = directory / f"{digest[:12]}_{safe_name}"
     if not path.is_file():
         path.write_bytes(contents)
+    if cache_key:
+        cache[cache_key] = {
+            "name": uploaded_file.name,
+            "size": uploaded_file.size,
+            "suffix": suffix,
+            "digest": digest,
+            "path": str(path),
+        }
     return digest, path
 
 
-def _set_detection_status(
-    session_id: str,
-    state: dict[str, Any],
-    detection: dict[str, Any],
-    status: str,
+def _stage_detection_decision(
+    statuses: dict[str, str], detection_ids: set[str], status: str
 ) -> None:
-    detection["history"].append(detection["status"])
-    detection["status"] = status
-    _save_state(session_id, state)
+    if status not in {"true_positive", "false_positive", "uncertain"}:
+        raise ValueError(f"Unsupported review status: {status}")
+    for detection_id in detection_ids:
+        statuses[detection_id] = status
 
 
-def _next_unreviewed_detection(
-    detections: list[dict[str, Any]], current_detection_id: str
-) -> str:
-    if not detections:
-        return ""
-    current_index = next(
-        (
-            index
-            for index, detection in enumerate(detections)
-            if detection["detection_id"] == current_detection_id
-        ),
-        -1,
+def _review_display_size(image_width: int, image_height: int) -> tuple[int, int]:
+    if image_width <= 0 or image_height <= 0:
+        raise ValueError("Image dimensions must be positive.")
+    scale = min(1.0, 720 / image_width, 640 / image_height)
+    return max(1, round(image_width * scale)), max(1, round(image_height * scale))
+
+
+def _review_frame_images(
+    frame: dict[str, Any], cache: dict[str, Any]
+) -> dict[str, Any] | None:
+    image_path = Path(frame["image_path"])
+    if not image_path.is_file():
+        return None
+    stat = image_path.stat()
+    cache_token = (
+        frame["frame_id"],
+        str(image_path),
+        stat.st_mtime_ns,
+        stat.st_size,
     )
-    ordered = detections[current_index + 1 :] + detections[: current_index + 1]
-    return next(
-        (detection["detection_id"] for detection in ordered if detection["status"] == "unreviewed"),
-        current_detection_id,
+    cached = cache.get("entry")
+    if isinstance(cached, dict) and cached.get("token") == cache_token:
+        return cached
+
+    image = cv2.imread(str(image_path))
+    if image is None:
+        return None
+    height, width = image.shape[:2]
+    display_size = _review_display_size(width, height)
+    display_bgr = cv2.resize(image, display_size, interpolation=cv2.INTER_AREA)
+    entry = {
+        "token": cache_token,
+        "image": image,
+        "display_bgr": display_bgr,
+        "display_rgb": cv2.cvtColor(display_bgr, cv2.COLOR_BGR2RGB),
+    }
+    cache["entry"] = entry
+    return entry
+
+
+def _cached_video_previews(
+    video_path: Path,
+    start_frame: int,
+    end_frame: int,
+    frames_to_skip: int,
+    cache: dict[str, Any],
+    cache_key: str,
+) -> tuple[np.ndarray, ...]:
+    video_stat = video_path.stat()
+    cache_token = (
+        str(video_path),
+        video_stat.st_mtime_ns,
+        video_stat.st_size,
+        start_frame,
+        end_frame,
+        frames_to_skip,
     )
+    cached = cache.get(cache_key)
+    if isinstance(cached, dict) and cached.get("token") == cache_token:
+        return cached["frames"]
+
+    thumbnails = []
+    for frame in preview_frames(video_path, start_frame, end_frame, frames_to_skip):
+        height, width = frame.shape[:2]
+        display_size = _review_display_size(width, height)
+        thumbnail = cv2.resize(frame, display_size, interpolation=cv2.INTER_AREA)
+        thumbnails.append(cv2.cvtColor(thumbnail, cv2.COLOR_BGR2RGB))
+    result = tuple(thumbnails)
+    cache[cache_key] = {"token": cache_token, "frames": result}
+    return result
 
 
-def _reset_canvas_draft(session_id: str, frame_id: str) -> None:
-    draft_key = f"{session_id}:{frame_id}:canvas_draft"
-    revision_key = f"{session_id}:{frame_id}:canvas_revision"
-    st.session_state.pop(draft_key, None)
-    st.session_state[revision_key] = int(st.session_state.get(revision_key, 0)) + 1
+def _delete_detections(
+    frame: dict[str, Any],
+    detection_ids: set[str],
+    staged_statuses: dict[str, str],
+) -> None:
+    frame["detections"] = [
+        detection
+        for detection in frame["detections"]
+        if detection["detection_id"] not in detection_ids
+    ]
+    for detection_id in detection_ids:
+        staged_statuses.pop(detection_id, None)
+    frame["annotation_complete"] = False
+
+
+def _reset_click_canvas(session_id: str, frame_id: str) -> None:
+    key = f"{session_id}:{frame_id}:click_revision"
+    st.session_state[key] = int(st.session_state.get(key, 0)) + 1
+
+
+def _detection_at_canvas_point(
+    detections: list[dict[str, Any]],
+    canvas_x: float,
+    canvas_y: float,
+    canvas_width: int,
+    canvas_height: int,
+    image_width: int,
+    image_height: int,
+) -> str | None:
+    if canvas_width <= 0 or canvas_height <= 0:
+        raise ValueError("Canvas dimensions must be positive.")
+    image_x = canvas_x * image_width / canvas_width
+    image_y = canvas_y * image_height / canvas_height
+    matches = [
+        detection
+        for detection in detections
+        if detection["x1"] <= image_x <= detection["x2"]
+        and detection["y1"] <= image_y <= detection["y2"]
+    ]
+    if not matches:
+        return None
+    selected = min(
+        matches,
+        key=lambda detection: (detection["x2"] - detection["x1"])
+        * (detection["y2"] - detection["y1"]),
+    )
+    return selected["detection_id"]
+
+
+def _canvas_point_coordinates(shape: dict[str, Any]) -> tuple[float, float] | None:
+    if shape.get("type") != "circle":
+        return None
+    try:
+        radius = float(shape["radius"])
+        stroke_width = float(shape.get("strokeWidth", 0))
+        left = float(shape["left"])
+        top = float(shape["top"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not all(np.isfinite(value) for value in (radius, stroke_width, left, top)):
+        return None
+    return left + radius + stroke_width / 2, top
+
+
+def _commit_frame_review(
+    frame: dict[str, Any],
+    staged_statuses: dict[str, str],
+    shapes: list[dict[str, Any]],
+    detection_by_stroke: dict[str, str],
+    class_by_stroke: dict[str, int],
+    scale_x: float,
+    scale_y: float,
+    class_names: list[str],
+    annotation_complete: bool,
+) -> None:
+    if any(
+        staged_statuses.get(detection["detection_id"], detection["status"]) == "unreviewed"
+        for detection in frame["detections"]
+    ):
+        raise ValueError(
+            "Some detections are still unreviewed. Mark them, or explicitly confirm "
+            "the remaining detections as true positives before saving."
+        )
+
+    for detection in frame["detections"]:
+        status = staged_statuses.get(detection["detection_id"], detection["status"])
+        if status != detection["status"]:
+            detection.setdefault("history", []).append(detection["status"])
+            detection["status"] = status
+    _save_canvas_annotations(
+        frame,
+        shapes,
+        detection_by_stroke,
+        class_by_stroke,
+        scale_x,
+        scale_y,
+        class_names,
+    )
+    frame["annotation_complete"] = bool(annotation_complete)
 
 
 def _video_signature(
@@ -305,11 +504,7 @@ def _process_videos(
     iou: float,
     image_size: int,
 ) -> None:
-    try:
-        model = YOLO(str(weights_path))
-    except Exception as error:
-        raise ValueError(f"Could not load the uploaded YOLO weights: {error}") from error
-
+    model = None
     output_dir = _session_directory(session_id)
     for video_id, video in state["videos"].items():
         settings = {
@@ -323,6 +518,15 @@ def _process_videos(
         signature = _video_signature(video, weights_hash, class_names, settings)
         if video.get("processed_signature") == signature:
             continue
+        if model is None:
+            try:
+                model, _ = _load_backend_model(
+                    "Ultralytics YOLO", weights_path, class_names, weights_hash
+                )
+            except Exception as error:
+                raise ValueError(
+                    f"Could not load the uploaded YOLO weights: {error}"
+                ) from error
 
         old_frames = [frame for frame in state["frames"] if frame["video_id"] == video_id]
         for frame in old_frames:
@@ -358,6 +562,7 @@ def _process_videos(
                     min(1.0, ((frame - start) // step + 1) / max(1, count)),
                     text=f"Processing {video['filename']} — frame {frame} of {end}",
                 ),
+                metadata=video["metadata"],
             )
         except Exception:
             progress.empty()
@@ -371,6 +576,7 @@ def _process_videos(
 
 def _upload_videos(session_id: str, state: dict[str, Any], uploads: list[Any]) -> list[str]:
     errors = []
+    changed = False
     for uploaded in uploads:
         suffix = Path(uploaded.name).suffix.lower()
         if suffix not in VIDEO_EXTENSIONS:
@@ -390,9 +596,10 @@ def _upload_videos(session_id: str, state: dict[str, Any], uploads: list[Any]) -
                     "end_seconds": metadata["duration"],
                     "frames_to_skip": 29,
                 }
+                changed = True
         except (OSError, ValueError) as error:
             errors.append(f"{uploaded.name}: {error}")
-    if not errors:
+    if changed:
         _save_state(session_id, state)
     return errors
 
@@ -425,7 +632,9 @@ def _render_upload_stage(
     st.caption(f"Class names and IDs are read from `{data_path}`.")
 
     configs_valid = True
+    settings_changed = False
     videos = list(state["videos"].items())
+    preview_cache = st.session_state.setdefault(f"{session_id}:video_previews", {})
     for video_id, video in videos:
         with st.expander(f"📹 {video['filename']}", expanded=True):
             metadata = video["metadata"]
@@ -435,7 +644,7 @@ def _render_upload_stage(
                 f"Resolution: **{metadata['width']} × {metadata['height']}**"
             )
             start_col, end_col, skip_col = st.columns(3)
-            video["start_seconds"] = start_col.number_input(
+            start_seconds = start_col.number_input(
                 "Start time (seconds)",
                 min_value=0.0,
                 max_value=float(metadata["duration"]),
@@ -443,7 +652,7 @@ def _render_upload_stage(
                 step=0.1,
                 key=f"{session_id}:{video_id}:start",
             )
-            video["end_seconds"] = end_col.number_input(
+            end_seconds = end_col.number_input(
                 "End time (seconds)",
                 min_value=0.0,
                 max_value=float(metadata["duration"]),
@@ -451,7 +660,7 @@ def _render_upload_stage(
                 step=0.1,
                 key=f"{session_id}:{video_id}:end",
             )
-            video["frames_to_skip"] = skip_col.number_input(
+            frames_to_skip = skip_col.number_input(
                 "Frames to skip",
                 min_value=0,
                 max_value=1_000_000,
@@ -460,6 +669,14 @@ def _render_upload_stage(
                 key=f"{session_id}:{video_id}:skip",
                 help="Frames skipped between processed frames: 0 processes every frame; 4 processes every fifth frame.",
             )
+            updated_settings = {
+                "start_seconds": float(start_seconds),
+                "end_seconds": float(end_seconds),
+                "frames_to_skip": int(frames_to_skip),
+            }
+            if any(video.get(key) != value for key, value in updated_settings.items()):
+                video.update(updated_settings)
+                settings_changed = True
             try:
                 first, last = frame_bounds(
                     video["start_seconds"],
@@ -474,21 +691,24 @@ def _render_upload_stage(
                     f"one frame every {video['frames_to_skip'] + 1} frames · "
                     f"approximately {len(sample_numbers)} sampled frames"
                 )
-                preview = preview_frames(
+                preview = _cached_video_previews(
                     Path(video["path"]),
                     first,
                     last,
                     video["frames_to_skip"],
+                    preview_cache,
+                    video_id,
                 )
                 if preview:
                     preview_columns = st.columns(len(preview))
                     for column, image in zip(preview_columns, preview):
-                        column.image(cv2.cvtColor(image, cv2.COLOR_BGR2RGB), width="stretch")
+                        column.image(image, width="stretch")
             except ValueError as error:
                 configs_valid = False
                 st.error(str(error))
 
-    _save_state(session_id, state)
+    if settings_changed:
+        _save_state(session_id, state)
     if not videos:
         st.info("Upload at least one video to configure its time interval and sampling.")
     if videos and not configs_valid:
@@ -546,42 +766,22 @@ def _canvas_drawing(
     frame: dict[str, Any],
     canvas_width: int,
     canvas_height: int,
-    selected_detection_id: str = "",
+    selected_detection_id: str | set[str] = "",
 ) -> tuple[dict[str, Any], dict[str, str], bool]:
     objects = []
     detection_by_stroke = {}
     used_strokes: set[str] = set()
     changed = False
-    status_indices: dict[str, int] = {}
-    status_hues = {
-        "unreviewed": 0.58,
-        "true_positive": 0.34,
-        "false_positive": 0.0,
-        "uncertain": 0.14,
-    }
+    selected_ids = (
+        {selected_detection_id}
+        if isinstance(selected_detection_id, str)
+        else selected_detection_id
+    )
     for detection in frame["detections"]:
-        status = detection["status"]
-        variant = status_indices.get(status, 0)
-        status_indices[status] = variant + 1
         stroke = str(detection.get("canvas_stroke", "")).lower()
-        if (
-            not stroke
-            or stroke in used_strokes
-            or detection.get("canvas_status") != status
-        ):
-            hue = status_hues.get(status, 0.58)
-            saturation = 0.8 - (variant % 4) * 0.06
-            value = 0.95 - (variant // 4 % 4) * 0.06
-            red, green, blue = colorsys.hsv_to_rgb(hue, saturation, value)
-            stroke = (
-                f"#{round(red * 255):02x}{round(green * 255):02x}"
-                f"{round(blue * 255):02x}"
-            )
-            while stroke in used_strokes:
-                stroke = _next_canvas_stroke(used_strokes)
-            used_strokes.add(stroke)
+        if not stroke or stroke in used_strokes:
+            stroke = _next_canvas_stroke(used_strokes)
             detection["canvas_stroke"] = stroke
-            detection["canvas_status"] = status
             changed = True
         else:
             used_strokes.add(stroke)
@@ -604,7 +804,7 @@ def _canvas_drawing(
                 "fill": "rgba(0,0,0,0)",
                 "stroke": stroke,
                 "strokeWidth": 4
-                if detection["detection_id"] == selected_detection_id
+                if detection["detection_id"] in selected_ids
                 else 1,
                 "selectable": True,
             }
@@ -613,37 +813,101 @@ def _canvas_drawing(
 
 
 def _review_image(
-    image: np.ndarray, detections: list[dict[str, Any]], selected_detection_id: str
+    image: np.ndarray,
+    detections: list[dict[str, Any]],
+    selected_detection_id: str | set[str],
+    staged_statuses: dict[str, str] | None = None,
+    coordinate_scale: tuple[float, float] = (1.0, 1.0),
 ) -> np.ndarray:
     preview = image.copy()
+    scale_x, scale_y = coordinate_scale
+    selected_ids = (
+        {selected_detection_id}
+        if isinstance(selected_detection_id, str)
+        else selected_detection_id
+    )
+    staged_statuses = staged_statuses or {}
     colors = {
         "unreviewed": (255, 190, 0),
         "true_positive": (45, 190, 45),
         "false_positive": (45, 45, 225),
         "uncertain": (0, 210, 255),
     }
+    label_rectangles: list[tuple[int, int, int, int]] = []
     for number, detection in enumerate(detections, 1):
         x1, y1, x2, y2 = (
-            int(round(float(detection[key]))) for key in ("x1", "y1", "x2", "y2")
+            int(round(float(detection[key]) * scale))
+            for key, scale in zip(
+                ("x1", "y1", "x2", "y2"),
+                (scale_x, scale_y, scale_x, scale_y),
+            )
         )
-        selected = detection["detection_id"] == selected_detection_id
-        status_color = colors.get(detection["status"], (255, 190, 0))
+        selected = detection["detection_id"] in selected_ids
+        status = staged_statuses.get(detection["detection_id"], detection["status"])
+        status_color = colors.get(status, (255, 190, 0))
         color = (
             status_color
             if selected
             else tuple(round(channel * 0.55) for channel in status_color)
         )
         cv2.rectangle(preview, (x1, y1), (x2, y2), color, 4 if selected else 1)
-        label = f"{number} {detection['class_name']} {detection['confidence']:.2f}"
-        label_y = max(20, y1 - 7)
+        label = f"#{number}"
+        (text_width, text_height), baseline = cv2.getTextSize(
+            label, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2
+        )
+        label_width = text_width + 14
+        label_height = text_height + baseline + 10
+        candidates = [
+            (x1, y1 - label_height),
+            (x1, y1),
+            (x2 - label_width, y1 - label_height),
+            (x2 - label_width, y1),
+            (x1, y2),
+        ]
+        label_left, label_top = candidates[0]
+        for candidate_left, candidate_top in candidates:
+            candidate_left = max(0, min(image.shape[1] - label_width, candidate_left))
+            candidate_top = max(0, min(image.shape[0] - label_height, candidate_top))
+            candidate = (
+                candidate_left,
+                candidate_top,
+                candidate_left + label_width,
+                candidate_top + label_height,
+            )
+            if not any(
+                candidate[0] < other[2]
+                and candidate[2] > other[0]
+                and candidate[1] < other[3]
+                and candidate[3] > other[1]
+                for other in label_rectangles
+            ):
+                label_left, label_top = candidate_left, candidate_top
+                break
+        label_rectangles.append(
+            (label_left, label_top, label_left + label_width, label_top + label_height)
+        )
+        cv2.rectangle(
+            preview,
+            (label_left, label_top),
+            (label_left + label_width, label_top + label_height),
+            (10, 10, 10),
+            thickness=-1,
+        )
+        cv2.rectangle(
+            preview,
+            (label_left, label_top),
+            (label_left + label_width, label_top + label_height),
+            color,
+            thickness=2,
+        )
         cv2.putText(
             preview,
             label,
-            (x1, label_y),
+            (label_left + 7, label_top + text_height + 5),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            color,
-            2 if selected else 1,
+            0.65,
+            (255, 255, 255),
+            2,
             cv2.LINE_AA,
         )
     return preview
@@ -720,7 +984,10 @@ def _save_canvas_annotations(
 ) -> None:
     live_strokes = set()
     existing = {detection["detection_id"]: detection for detection in frame["detections"]}
-    manual_count = sum(bool(detection.get("manual")) for detection in frame["detections"])
+    manual_count = max(
+        int(frame.get("manual_detection_count", 0)),
+        sum(bool(detection.get("manual")) for detection in frame["detections"]),
+    )
     for shape in shapes:
         if shape.get("type") != "rect":
             continue
@@ -754,6 +1021,7 @@ def _save_canvas_annotations(
             }
             frame["detections"].append(detection)
             existing[detection_id] = detection
+            frame["manual_detection_count"] = manual_count
         live_strokes.add(stroke)
 
     deleted_manual_ids = set()
@@ -776,7 +1044,7 @@ def _save_canvas_annotations(
 
 
 def _render_review_stage(session_id: str, state: dict[str, Any]) -> None:
-    st.header("B · Review individual detections")
+    st.header("B · Batch frame review")
     frames = state["frames"]
     if not frames:
         st.info("Run detection first. Only frames containing model detections are saved for review.")
@@ -788,11 +1056,8 @@ def _render_review_stage(session_id: str, state: dict[str, Any]) -> None:
         st.session_state[current_key] = frame_options[0]
     frame_index = frame_options.index(st.session_state[current_key])
     reviewed_frames = sum(
-        bool(frame["detections"])
-        and all(
-            detection["status"] in {"true_positive", "false_positive"}
-            for detection in frame["detections"]
-        )
+        bool(frame["annotation_complete"])
+        and all(detection["status"] != "unreviewed" for detection in frame["detections"])
         for frame in frames
     )
     remaining_frames = len(frames) - reviewed_frames
@@ -849,85 +1114,242 @@ def _render_review_stage(session_id: str, state: dict[str, Any]) -> None:
         st.rerun()
 
     frame = frames[frame_index]
-    image = cv2.imread(frame["image_path"])
-    if image is None:
+    image_cache = st.session_state.setdefault(f"{session_id}:review_image", {})
+    cached_images = _review_frame_images(frame, image_cache)
+    if cached_images is None:
         st.error(f"Could not read saved frame: {frame['image_path']}")
         return
+    image = cached_images["image"]
+    display_bgr = cached_images["display_bgr"]
+    original_display = cached_images["display_rgb"]
 
     class_names = state["class_names"]
     frame["width"], frame["height"] = image.shape[1], image.shape[0]
     detections = frame["detections"]
-    detection_key = f"{session_id}:{frame['frame_id']}:selected_detection"
     detection_ids = [detection["detection_id"] for detection in detections]
-    if st.session_state.get(detection_key) not in detection_ids:
-        st.session_state[detection_key] = next(
-            (
-                detection["detection_id"]
-                for detection in detections
-                if detection["status"] == "unreviewed"
-            ),
-            detection_ids[0] if detection_ids else "",
-        )
-    detection_id = st.session_state[detection_key]
-    selected_detection = next(
-        (detection for detection in detections if detection["detection_id"] == detection_id),
-        None,
-    )
 
-    selected_count = sum(detection["status"] != "unreviewed" for detection in detections)
-    st.progress(
-        selected_count / len(detections) if detections else 1.0,
-        text=f"{selected_count}/{len(detections)} detections reviewed in this frame",
+    status_key = f"{session_id}:{frame['frame_id']}:staged_statuses"
+    if status_key not in st.session_state:
+        st.session_state[status_key] = {
+            detection["detection_id"]: detection["status"] for detection in detections
+        }
+    staged_statuses: dict[str, str] = st.session_state[status_key]
+    for detection in detections:
+        staged_statuses.setdefault(detection["detection_id"], detection["status"])
+    accepted_count = sum(
+        staged_statuses[detection["detection_id"]] == "true_positive"
+        for detection in detections
     )
-    if detections:
-        with st.expander("Select a detection", expanded=False):
-            number_columns = st.columns(8)
-            symbols = {
-                "unreviewed": "○",
-                "true_positive": "✓",
-                "false_positive": "×",
-                "uncertain": "?",
-            }
-            for number, detection in enumerate(detections, 1):
-                if number_columns[(number - 1) % len(number_columns)].button(
-                    f"{number} {symbols.get(detection['status'], '○')}",
-                    key=f"{session_id}:{frame['frame_id']}:select:{detection['detection_id']}",
-                    type="primary" if detection["detection_id"] == detection_id else "secondary",
-                    help=f"{detection['class_name']} · {detection['status'].replace('_', ' ')}",
-                ):
-                    st.session_state[detection_key] = detection["detection_id"]
-                    _reset_canvas_draft(session_id, frame["frame_id"])
-                    st.rerun()
+    rejected_count = sum(
+        staged_statuses[detection["detection_id"]] == "false_positive"
+        for detection in detections
+    )
+    uncertain_count = sum(
+        staged_statuses[detection["detection_id"]] == "uncertain"
+        for detection in detections
+    )
+    manual_count = sum(bool(detection.get("manual")) for detection in detections)
+    stats = st.columns(5)
+    stats[0].metric("Detections", len(detections))
+    stats[1].metric("Accepted", accepted_count)
+    stats[2].metric("Rejected", rejected_count)
+    stats[3].metric("Uncertain", uncertain_count)
+    stats[4].metric("Manual", manual_count)
 
+    selection_key = f"{session_id}:{frame['frame_id']}:selected_detections"
+    completeness_key = f"{session_id}:{frame['frame_id']}:complete"
+    selected_ids: set[str] = set(st.session_state.get(selection_key, set()))
+    selected_ids.intersection_update(detection_ids)
     image_height, image_width = image.shape[:2]
-    display_scale = min(1.0, 1000 / image_width, 700 / image_height)
-    canvas_width = max(1, round(image_width * display_scale))
-    canvas_height = max(1, round(image_height * display_scale))
+    canvas_height, canvas_width = display_bgr.shape[:2]
     scale_x = image_width / canvas_width
     scale_y = image_height / canvas_height
+    review_preview = _review_image(
+        display_bgr,
+        detections,
+        selected_ids,
+        staged_statuses,
+        (1 / scale_x, 1 / scale_y),
+    )
+    review_display = Image.fromarray(
+        cv2.cvtColor(review_preview, cv2.COLOR_BGR2RGB)
+    )
+    original_column, annotated_column = st.columns(2)
+    original_column.caption(
+        f"Original · frame {frame['frame_number']} · "
+        f"{frame['timestamp_seconds']:.2f}s"
+    )
+    original_column.image(original_display, width=canvas_width)
+    annotated_column.caption("Detected · all numbered boxes")
+    click_revision_key = f"{session_id}:{frame['frame_id']}:click_revision"
+    click_revision = int(st.session_state.get(click_revision_key, 0))
+    with annotated_column:
+        _prepare_canvas_component()
+        click_result = st_canvas(
+            fill_color="rgba(0,0,0,0)",
+            stroke_width=0,
+            stroke_color="#ffffff",
+            background_image=review_display,
+            width=canvas_width,
+            height=canvas_height,
+            drawing_mode="point",
+            initial_drawing={"version": "4.4.0", "objects": []},
+            update_streamlit=True,
+            display_toolbar=False,
+            point_display_radius=1,
+            key=f"{session_id}:{frame['frame_id']}:click:{click_revision}",
+        )
+    click_json = getattr(click_result, "json_data", None)
+    if isinstance(click_json, dict):
+        click_points = [
+            point
+            for shape in click_json.get("objects", [])
+            if isinstance(shape, dict)
+            and (point := _canvas_point_coordinates(shape)) is not None
+        ]
+        if click_points:
+            clicked_detection_id = _detection_at_canvas_point(
+                detections,
+                *click_points[-1],
+                canvas_width,
+                canvas_height,
+                image_width,
+                image_height,
+            )
+            if clicked_detection_id:
+                st.session_state[selection_key] = {clicked_detection_id}
+            st.session_state[click_revision_key] = click_revision + 1
+            st.rerun()
+    st.caption("Box colours: 🟠 unreviewed · 🟢 accepted · 🔴 rejected · 🟡 uncertain")
+    if detections:
+        st.caption(
+            "Click detection numbers to select several at once. Selections are staged "
+            "until you save the frame."
+        )
+        number_columns = st.columns(min(8, len(detections)))
+        symbols = {
+            "unreviewed": "○",
+            "true_positive": "✓",
+            "false_positive": "×",
+            "uncertain": "?",
+        }
+        for number, detection in enumerate(detections, 1):
+            detection_id_for_number = detection["detection_id"]
+            status = staged_statuses[detection_id_for_number]
+            if number_columns[(number - 1) % len(number_columns)].button(
+                f"#{number} {symbols.get(status, '○')}",
+                key=f"{session_id}:{frame['frame_id']}:select:{detection_id_for_number}",
+                type="primary" if detection_id_for_number in selected_ids else "secondary",
+                help=(
+                    f"{detection['class_name']} · {detection['confidence']:.3f} · "
+                    f"{status.replace('_', ' ')}"
+                ),
+            ):
+                if detection_id_for_number in selected_ids:
+                    selected_ids.remove(detection_id_for_number)
+                else:
+                    selected_ids.add(detection_id_for_number)
+                st.session_state[selection_key] = selected_ids
+                _reset_click_canvas(session_id, frame["frame_id"])
+                st.rerun()
+
+        bulk_actions = st.columns(3)
+        if bulk_actions[0].button(
+            "Select all as true positive",
+            key=f"{session_id}:{frame['frame_id']}:all_true",
+        ):
+            _stage_detection_decision(
+                staged_statuses, set(detection_ids), "true_positive"
+            )
+            st.session_state[selection_key] = set(detection_ids)
+            _reset_click_canvas(session_id, frame["frame_id"])
+            st.rerun()
+        if bulk_actions[1].button(
+            "Select all as false positive",
+            key=f"{session_id}:{frame['frame_id']}:all_false",
+        ):
+            _stage_detection_decision(
+                staged_statuses, set(detection_ids), "false_positive"
+            )
+            st.session_state[selection_key] = set(detection_ids)
+            _reset_click_canvas(session_id, frame["frame_id"])
+            st.rerun()
+        if bulk_actions[2].button(
+            "Confirm remaining as true positives",
+            key=f"{session_id}:{frame['frame_id']}:confirm_remaining",
+            disabled=not any(
+                staged_statuses[detection_id] == "unreviewed"
+                for detection_id in detection_ids
+            ),
+        ):
+            remaining_ids = {
+                detection_id
+                for detection_id in detection_ids
+                if staged_statuses[detection_id] == "unreviewed"
+            }
+            _stage_detection_decision(staged_statuses, remaining_ids, "true_positive")
+            st.session_state[selection_key] = remaining_ids
+            _reset_click_canvas(session_id, frame["frame_id"])
+            st.rerun()
+        selection_actions = st.columns(4)
+        if selection_actions[0].button(
+            "Clear selections",
+            key=f"{session_id}:{frame['frame_id']}:clear_selection",
+            disabled=not selected_ids,
+        ):
+            st.session_state[selection_key] = set()
+            _reset_click_canvas(session_id, frame["frame_id"])
+            st.rerun()
+        for column, status, label in (
+            (selection_actions[1], "true_positive", "Mark selected true"),
+            (selection_actions[2], "false_positive", "Mark selected false"),
+            (selection_actions[3], "uncertain", "Mark selected uncertain"),
+        ):
+            if column.button(
+                label,
+                key=f"{session_id}:{frame['frame_id']}:mark_{status}",
+                disabled=not selected_ids,
+            ):
+                _stage_detection_decision(staged_statuses, selected_ids, status)
+                _reset_click_canvas(session_id, frame["frame_id"])
+                st.rerun()
+        selected_detections = [
+            detection for detection in detections if detection["detection_id"] in selected_ids
+        ]
+        if len(selected_detections) == 1:
+            selected = selected_detections[0]
+            st.markdown(
+                f"**#{detection_ids.index(selected['detection_id']) + 1} · "
+                f"{selected.get('predicted_class', selected['class_name'])} · "
+                f"{selected['confidence']:.3f} confidence**"
+            )
+        elif selected_detections:
+            st.caption("Selected detections:")
+            for selected in selected_detections:
+                st.write(
+                    f"#{detection_ids.index(selected['detection_id']) + 1} · "
+                    f"{selected.get('predicted_class', selected['class_name'])} · "
+                    f"{selected['confidence']:.3f} confidence"
+                )
+
     initial_drawing, detection_by_stroke, drawing_changed = _canvas_drawing(
         frame,
         canvas_width,
         canvas_height,
-        detection_id,
+        selected_ids,
     )
     if drawing_changed:
         _save_state(session_id, state)
-    numbered_image = _review_image(image, detections, detection_id)
-    display_image = Image.fromarray(cv2.cvtColor(numbered_image, cv2.COLOR_BGR2RGB)).resize(
-        (canvas_width, canvas_height), Image.Resampling.LANCZOS
-    )
+    display_image = Image.fromarray(original_display)
     drawing_mode_key = f"{session_id}:{frame['frame_id']}:draw_mode"
     if drawing_mode_key not in st.session_state:
         st.session_state[drawing_mode_key] = "edit"
-    tool_columns = st.columns([1, 1, 4])
+    tool_columns = st.columns([1, 1, 2])
     if tool_columns[0].button("＋ Add insect", key=f"{session_id}:{frame['frame_id']}:add_insect"):
         st.session_state[drawing_mode_key] = "add"
-        _reset_canvas_draft(session_id, frame["frame_id"])
         st.rerun()
     if tool_columns[1].button("Edit boxes", key=f"{session_id}:{frame['frame_id']}:edit_boxes"):
         st.session_state[drawing_mode_key] = "edit"
-        _reset_canvas_draft(session_id, frame["frame_id"])
         st.rerun()
     drawing_mode_label = st.session_state[drawing_mode_key]
     draft_key = f"{session_id}:{frame['frame_id']}:canvas_draft"
@@ -941,7 +1363,7 @@ def _render_review_stage(session_id: str, state: dict[str, Any]) -> None:
         shape["strokeWidth"] = (
             4
             if detection_by_stroke.get(str(shape.get("stroke", "")).lower())
-            == (selected_detection["detection_id"] if selected_detection else "")
+            in selected_ids
             else 2
         )
     previous_strokes = {
@@ -950,20 +1372,24 @@ def _render_review_stage(session_id: str, state: dict[str, Any]) -> None:
         if isinstance(shape, dict)
     }
 
-    _prepare_canvas_component()
-    canvas_result = st_canvas(
-        fill_color="rgba(0, 166, 255, 0.08)",
-        stroke_width=3,
-        stroke_color="#00A6FF",
-        background_image=display_image,
-        width=canvas_width,
-        height=canvas_height,
-        drawing_mode="rect" if drawing_mode_label == "add" else "transform",
-        initial_drawing=drawing,
-        update_streamlit=True,
-        display_toolbar=False,
-        key=f"{session_id}:{frame['frame_id']}:canvas:{revision}",
-    )
+    with st.expander(
+        "Add, correct, or delete bounding boxes",
+        expanded=drawing_mode_label == "add",
+    ):
+        _prepare_canvas_component()
+        canvas_result = st_canvas(
+            fill_color="rgba(0, 166, 255, 0.08)",
+            stroke_width=3,
+            stroke_color="#00A6FF",
+            background_image=display_image,
+            width=canvas_width,
+            height=canvas_height,
+            drawing_mode="rect" if drawing_mode_label == "add" else "transform",
+            initial_drawing=drawing,
+            update_streamlit=True,
+            display_toolbar=False,
+            key=f"{session_id}:{frame['frame_id']}:canvas:{revision}",
+        )
 
     result_drawing = getattr(canvas_result, "json_data", None)
     if not isinstance(result_drawing, dict):
@@ -988,182 +1414,138 @@ def _render_review_stage(session_id: str, state: dict[str, Any]) -> None:
         for shape in result_drawing.get("objects", [])
         if isinstance(shape, dict) and shape.get("type") == "rect"
     ]
+    if selected_ids and st.button(
+        "Delete selected boxes",
+        key=f"{session_id}:{frame['frame_id']}:delete_selected_boxes",
+    ):
+        deleted_strokes = {
+            stroke
+            for stroke, selected_detection_id in detection_by_stroke.items()
+            if selected_detection_id in selected_ids
+        }
+        result_drawing["objects"] = [
+            shape
+            for shape in result_drawing["objects"]
+            if not (
+                isinstance(shape, dict)
+                and str(shape.get("stroke", "")).lower() in deleted_strokes
+            )
+        ]
+        _delete_detections(frame, selected_ids, staged_statuses)
+        _save_state(session_id, state)
+        st.session_state[draft_key] = result_drawing
+        st.session_state[selection_key] = set()
+        st.session_state[completeness_key] = False
+        st.session_state[revision_key] = revision + 1
+        st.rerun()
     class_by_stroke: dict[str, int] = {}
-    detection_lookup = {
-        detection["detection_id"]: detection for detection in frame["detections"]
-    }
     new_strokes = []
     for shape in shapes:
         stroke = str(shape.get("stroke", "")).lower()
         detection_id = detection_by_stroke.get(stroke)
         if detection_id:
-            detection = detection_lookup[detection_id]
+            detection = next(
+                item for item in frame["detections"] if item["detection_id"] == detection_id
+            )
             class_by_stroke[stroke] = int(detection["class_id"])
         else:
             new_strokes.append(stroke)
-    if new_strokes:
-        new_class_id = int(
-            st.selectbox(
-                "Class for added insects",
-                range(len(class_names)),
-                index=(
-                    int(selected_detection["class_id"])
-                    if selected_detection and selected_detection["class_id"] < len(class_names)
-                    else 0
-                ),
-                format_func=lambda value: f"{value}: {class_names[value]}",
-                key=f"{session_id}:{frame['frame_id']}:new_class",
-            )
+    if len(selected_ids) == 1:
+        selected_id = next(iter(selected_ids))
+        selected_item = next(
+            (item for item in frame["detections"] if item["detection_id"] == selected_id),
+            None,
         )
-        for stroke in new_strokes:
-            class_by_stroke[stroke] = new_class_id
+        if selected_item is not None:
+            selected_class_id = int(
+                st.selectbox(
+                    "Correct selected class",
+                    range(len(class_names)),
+                    index=int(selected_item["class_id"]),
+                    format_func=lambda value: f"{value}: {class_names[value]}",
+                    key=f"{session_id}:{frame['frame_id']}:class_edit:{selected_id}",
+                )
+            )
+            if selected_item.get("canvas_stroke"):
+                class_by_stroke[selected_item["canvas_stroke"]] = selected_class_id
+    if new_strokes:
+        st.caption("Choose a class for each newly drawn insect:")
+        for number, stroke in enumerate(new_strokes, 1):
+            class_by_stroke[stroke] = int(
+                st.selectbox(
+                    f"New insect box {number} class",
+                    range(len(class_names)),
+                    format_func=lambda value: f"{value}: {class_names[value]}",
+                    key=f"{session_id}:{frame['frame_id']}:new_class:{stroke}",
+                )
+            )
     if drawing_mode_label == "add":
-        st.caption("Draw one or more rectangles on the image, then save them as true-positive annotations.")
+        st.caption("Draw one or more rectangles on the original frame; they are saved as true positives.")
+
+    st.checkbox(
+        "I have checked the entire frame; all target insects are annotated.",
+        value=bool(frame["annotation_complete"]),
+        key=completeness_key,
+        help="Required before export. This prevents a frame with a missed insect from becoming a false negative.",
+    )
+    if any(staged_statuses[item["detection_id"]] == "unreviewed" for item in detections):
+        st.warning(
+            "Unreviewed detections must be classified before saving. Use "
+            "'Confirm remaining as true positives' only after checking those boxes."
+        )
+    if uncertain_count:
+        st.warning(
+            f"{uncertain_count} uncertain detection(s) will be saved as uncertain and "
+            "this frame will remain excluded from dataset export."
+        )
+    if not st.session_state[completeness_key]:
+        st.warning(
+            "Confirm that every target insect in the frame is annotated before this "
+            "frame can be included in the dataset."
+        )
     if st.button(
-        "Save boxes",
+        "Save Frame & Next",
         type="primary",
-        key=f"{session_id}:{frame['frame_id']}:save_boxes",
-        disabled=not shapes,
+        key=f"{session_id}:{frame['frame_id']}:save_frame_next",
     ):
         try:
-            _save_canvas_annotations(
+            for detection in detections:
+                status = staged_statuses[detection["detection_id"]]
+                if status != "unreviewed":
+                    continue
+                raise ValueError(
+                    "Some detections are still unreviewed. Mark them, or explicitly "
+                    "confirm the remaining detections as true positives before saving."
+                )
+            _commit_frame_review(
                 frame,
+                staged_statuses,
                 result_drawing["objects"],
                 detection_by_stroke,
                 class_by_stroke,
                 scale_x,
                 scale_y,
                 class_names,
+                bool(st.session_state[completeness_key]),
             )
             _save_state(session_id, state)
+            st.session_state.pop(status_key, None)
+            st.session_state.pop(selection_key, None)
             st.session_state.pop(draft_key, None)
             st.session_state[revision_key] = revision + 1
             st.session_state[drawing_mode_key] = "edit"
+            if frame_index + 1 < len(frame_options):
+                st.session_state[current_key] = frame_options[frame_index + 1]
             st.rerun()
         except (KeyError, TypeError, ValueError) as error:
-            st.error(f"Could not save these boxes: {error}")
-
-    if selected_detection is not None:
-        detection_number = detection_ids.index(selected_detection["detection_id"]) + 1
-        st.subheader(f"Detection {detection_number}")
-        st.caption(
-            f"{'Manually added' if selected_detection.get('manual') else 'Predicted'} · "
-            f"{selected_detection.get('predicted_class', selected_detection['class_name'])} · "
-            f"confidence {selected_detection['confidence']:.3f} · "
-            f"{selected_detection['status'].replace('_', ' ')}"
-        )
-        selected_class_id = st.selectbox(
-            "Selected box class",
-            range(len(class_names)),
-            index=int(selected_detection["class_id"]),
-            format_func=lambda value: f"{value}: {class_names[value]}",
-            key=f"{session_id}:{frame['frame_id']}:selected_class:{detection_id}",
-        )
-        if selected_class_id != selected_detection["class_id"]:
-            selected_detection["class_id"] = selected_class_id
-            selected_detection["class_name"] = class_names[selected_class_id]
-            frame["annotation_complete"] = False
-            _save_state(session_id, state)
-            _reset_canvas_draft(session_id, frame["frame_id"])
-            st.rerun()
-
-        detection_position = detection_ids.index(detection_id)
-        decision_columns = st.columns(7)
-        try:
-            if decision_columns[0].button("Keep detection", key=f"{session_id}:{detection_id}:keep"):
-                _set_detection_status(session_id, state, selected_detection, "true_positive")
-                st.session_state[detection_key] = _next_unreviewed_detection(
-                    detections, detection_id
-                )
-                _reset_canvas_draft(session_id, frame["frame_id"])
-                st.rerun()
-            if decision_columns[1].button("Reject detection", key=f"{session_id}:{detection_id}:reject"):
-                _set_detection_status(session_id, state, selected_detection, "false_positive")
-                st.session_state[detection_key] = _next_unreviewed_detection(
-                    detections, detection_id
-                )
-                _reset_canvas_draft(session_id, frame["frame_id"])
-                st.rerun()
-            if decision_columns[2].button("Mark uncertain", key=f"{session_id}:{detection_id}:uncertain"):
-                _set_detection_status(session_id, state, selected_detection, "uncertain")
-                st.session_state[detection_key] = _next_unreviewed_detection(
-                    detections, detection_id
-                )
-                _reset_canvas_draft(session_id, frame["frame_id"])
-                st.rerun()
-            if decision_columns[3].button(
-                "Undo decision",
-                disabled=not selected_detection["history"],
-                key=f"{session_id}:{detection_id}:undo",
-            ):
-                selected_detection["status"] = selected_detection["history"].pop()
-                _save_state(session_id, state)
-                _reset_canvas_draft(session_id, frame["frame_id"])
-                st.rerun()
-            if decision_columns[4].button(
-                "← Previous",
-                disabled=detection_position == 0,
-                key=f"{session_id}:{detection_id}:previous_detection",
-            ):
-                st.session_state[detection_key] = detection_ids[detection_position - 1]
-                _reset_canvas_draft(session_id, frame["frame_id"])
-                st.rerun()
-            if decision_columns[5].button(
-                "Next →",
-                disabled=detection_position + 1 >= len(detection_ids),
-                key=f"{session_id}:{detection_id}:next_detection",
-            ):
-                st.session_state[detection_key] = detection_ids[detection_position + 1]
-                _reset_canvas_draft(session_id, frame["frame_id"])
-                st.rerun()
-            if decision_columns[6].button(
-                "Delete box",
-                key=f"{session_id}:{detection_id}:delete_detection",
-            ):
-                frame["detections"] = [
-                    detection
-                    for detection in frame["detections"]
-                    if detection["detection_id"] != detection_id
-                ]
-                remaining_ids = [
-                    detection["detection_id"] for detection in frame["detections"]
-                ]
-                st.session_state[detection_key] = next(
-                    (
-                        detection["detection_id"]
-                        for detection in frame["detections"]
-                        if detection["status"] == "unreviewed"
-                    ),
-                    remaining_ids[0] if remaining_ids else "",
-                )
-                frame["annotation_complete"] = False
-                _save_state(session_id, state)
-                _reset_canvas_draft(session_id, frame["frame_id"])
-                st.rerun()
-        except (KeyError, ValueError) as error:
-            st.error(f"Could not save this detection: {error}")
-
-    completeness_key = f"{session_id}:{frame['frame_id']}:complete"
-    complete = st.checkbox(
-        "I have checked the entire frame; all target insects are annotated.",
-        value=bool(frame["annotation_complete"]),
-        key=completeness_key,
-        help="Required before export. This prevents a frame with a missed insect from becoming a false negative.",
-    )
-    if bool(complete) != bool(frame["annotation_complete"]):
-        frame["annotation_complete"] = bool(complete)
-        _save_state(session_id, state)
-    if any(detection["status"] in {"unreviewed", "uncertain"} for detection in detections):
-        st.warning("Resolve every detection, including uncertain ones, before this frame can be exported.")
+            st.error(f"Could not save frame: {error}")
 
 
 def _render_export_stage(session_id: str, state: dict[str, Any], data_path: Path) -> None:
     st.header("C · Create and download dataset")
     frames = state["frames"]
-    detections = [detection for frame in frames for detection in frame["detections"]]
     complete_frames = sum(
         frame["annotation_complete"]
-        and bool(frame["detections"])
         and all(
             detection["status"] in {"true_positive", "false_positive"}
             for detection in frame["detections"]
@@ -1174,8 +1556,6 @@ def _render_export_stage(session_id: str, state: dict[str, Any], data_path: Path
         f"{complete_frames} complete frame(s) are currently eligible. Frames with "
         "unreviewed/uncertain detections, or without whole-frame annotation confirmation, are excluded."
     )
-    if not detections:
-        return
     try:
         class_names = _read_class_names(data_path)
     except (OSError, ValueError, yaml.YAMLError) as error:
@@ -1190,7 +1570,7 @@ def _render_export_stage(session_id: str, state: dict[str, Any], data_path: Path
 
     st.download_button(
         "Download detection review CSV",
-        data=report_csv(frames),
+        data=lambda reviewed_frames=frames: report_csv(reviewed_frames),
         file_name="review_report.csv",
         mime="text/csv",
         key=f"{session_id}:download_csv",
@@ -1247,20 +1627,45 @@ def _render_export_stage(session_id: str, state: dict[str, Any], data_path: Path
         )
 
 
-def _load_backend_model(model_type: str, weights_path: Path, class_names: list[str]) -> Any:
+@st.cache_resource(max_entries=1)
+def _load_backend_model_cached(
+    model_type: str,
+    weights_fingerprint: str,
+    class_names: tuple[str, ...],
+    _weights_path: str,
+) -> Any:
+    checkpoint_path = Path(_weights_path)
     if model_type == "Ultralytics YOLO":
-        model = YOLO(str(weights_path))
+        model = _get_yolo_class()(str(checkpoint_path))
         try:
             names = list(model.names.values()) if hasattr(model, "names") else class_names
         except Exception:
             names = class_names
-        return model, names
+        return model, list(names)
     if model_type == "RF-DETR":
-        if RFDETRLarge is None:
-            raise ValueError("RF-DETR is not available in the current environment.")
-        model = RFDETRLarge.from_checkpoint(str(weights_path))
-        return model, class_names
+        model = _get_rfdetr_class().from_checkpoint(str(checkpoint_path))
+        return model, list(class_names)
     raise ValueError(f"Unsupported model backend: {model_type}")
+
+
+def _load_backend_model(
+    model_type: str,
+    weights_path: Path,
+    class_names: list[str],
+    weights_hash: str | None = None,
+) -> Any:
+    if weights_hash is None:
+        try:
+            stat = weights_path.stat()
+            weights_hash = f"{weights_path}:{stat.st_mtime_ns}:{stat.st_size}"
+        except OSError:
+            weights_hash = str(weights_path)
+    return _load_backend_model_cached(
+        model_type,
+        weights_hash,
+        tuple(class_names),
+        str(weights_path),
+    )
 
 
 def _as_array(value: Any) -> np.ndarray:
@@ -1402,11 +1807,15 @@ def _run_detection_backend(
     timestamp_status: Any,
     stop_key: str,
     tracking_config: dict[str, Any] | None = None,
+    metadata: dict[str, Any] | None = None,
+    video_filename: str | None = None,
+    weights_hash: str | None = None,
 ) -> tuple[Path, Path]:
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise ValueError(f"Could not open video: {video_path}")
-    metadata = read_video_metadata(video_path)
+    if metadata is None:
+        metadata = read_video_metadata(video_path)
     start_frame, end_frame = frame_bounds(
         start_seconds,
         end_seconds,
@@ -1418,7 +1827,8 @@ def _run_detection_backend(
     total_selected = max(0, (end_frame - start_frame + step - 1) // step)
     output_dir = _session_directory(session_id) / "detection_exports"
     output_dir.mkdir(parents=True, exist_ok=True)
-    title = video_path.stem
+    source_name = Path((video_filename or video_path.name).replace("\\", "/")).name
+    title = Path(source_name).stem
     video_output = output_dir / (
         f"{title}_tracked.mp4" if tracking_config is not None else f"{title}_annotated.mp4"
     )
@@ -1428,11 +1838,13 @@ def _run_detection_backend(
     temporary_video.unlink(missing_ok=True)
     writer = None
     try:
-        model, model_names = _load_backend_model(model_type, weights_path, class_names)
+        model, model_names = _load_backend_model(
+            model_type, weights_path, class_names, weights_hash
+        )
         cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
         ok, first_frame = cap.read()
         if not ok:
-            raise ValueError(f"Could not read the selected start frame from {video_path.name}.")
+            raise ValueError(f"Could not read the selected start frame from {source_name}.")
         height, width = first_frame.shape[:2]
         writer = cv2.VideoWriter(
             str(temporary_video),
@@ -1442,7 +1854,7 @@ def _run_detection_backend(
         )
         if not writer.isOpened():
             raise ValueError(
-                f"Could not create a temporary video for {video_path.name}; "
+                f"Could not create a temporary video for {source_name}; "
                 "check OpenCV MP4 codec support."
             )
 
@@ -1461,7 +1873,14 @@ def _run_detection_backend(
         processed = 0
         detection_count = 0
         tracked_detection_count = 0
-        tracker = ByteTracker(tracking_config) if tracking_config is not None else None
+        if tracking_config is not None:
+            from tracking.detector import Detection
+            from tracking.tracker import Tracker
+            from tracking.video_utils import draw_tracks
+
+            tracker = Tracker(tracking_config)
+        else:
+            tracker = None
         tracks_by_id: dict[int, dict[str, int]] = {}
         tracking_started = time.perf_counter()
         with csv_output.open("w", newline="", encoding="utf-8") as csv_file:
@@ -1523,7 +1942,7 @@ def _run_detection_backend(
                     timestamp = frame_counter / metadata["fps"]
                     for detection_index, item in enumerate(normalized):
                         row = {
-                            "video": video_path.name,
+                            "video": source_name,
                             "frame_number": frame_counter,
                             "timestamp_seconds": timestamp,
                             **item,
@@ -1538,7 +1957,7 @@ def _run_detection_backend(
                     processed += 1
                     progress.progress(
                         min(1.0, processed / max(1, total_selected)),
-                        text=f"{video_path.name}: {processed}/{total_selected} sampled frames",
+                        text=f"{source_name}: {processed}/{total_selected} sampled frames",
                     )
                     preview.image(
                         cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB),
@@ -1653,7 +2072,7 @@ def _transcode_mp4(source: Path, destination: Path) -> None:
 def _render_detection_mode(session_id: str, data_path: Path) -> None:
     st.header("Detection mode")
     model_type = st.selectbox("Model type", MODEL_BACKENDS, index=0, key=f"{session_id}:detection_model")
-    if model_type == "RF-DETR" and RFDETRLarge is None:
+    if model_type == "RF-DETR" and not _rfdetr_available():
         st.warning("RF-DETR is not installed in the current environment, so it cannot be tested here.")
     elif model_type == "RF-DETR":
         st.caption("Upload a fine-tuned RFDETRLarge checkpoint (.pth) from this project's RF-DETR training workflow.")
@@ -1769,12 +2188,20 @@ def _render_detection_mode(session_id: str, data_path: Path) -> None:
             )
     class_names = _read_class_names(data_path)
     video_settings: dict[str, dict[str, float]] = {}
+    video_paths: dict[str, Path] = {}
+    video_metadata: dict[str, dict[str, Any]] = {}
     for uploaded in videos:
-        temp_dir = _session_directory(session_id) / "detection_preview"
-        temp_dir.mkdir(parents=True, exist_ok=True)
-        temp_path = temp_dir / uploaded.name
-        temp_path.write_bytes(uploaded.getvalue())
-        metadata = read_video_metadata(temp_path)
+        digest, temp_path = _store_upload(
+            session_id, uploaded, Path(uploaded.name).suffix.lower(), "detection"
+        )
+        upload_id = str(getattr(uploaded, "file_id", uploaded.name))
+        metadata_key = f"{session_id}:detection_metadata:{digest}"
+        metadata = st.session_state.get(metadata_key)
+        if metadata is None or not temp_path.is_file():
+            metadata = read_video_metadata(temp_path)
+            st.session_state[metadata_key] = metadata
+        video_paths[upload_id] = temp_path
+        video_metadata[upload_id] = metadata
         with st.expander(f"{uploaded.name} settings", expanded=True):
             start_seconds = st.number_input(
                 f"Start time ({uploaded.name})",
@@ -1815,17 +2242,20 @@ def _render_detection_mode(session_id: str, data_path: Path) -> None:
         else:
             st.session_state[stop_key] = False
             st.session_state["detection_outputs"] = {}
-            output_dir = _session_directory(session_id) / "uploads"
-            output_dir.mkdir(parents=True, exist_ok=True)
-            weights_path = output_dir / f"weights{Path(weights_file.name).suffix.lower()}"
-            weights_path.write_bytes(weights_file.getvalue())
+            weights_hash, weights_path = _store_upload(
+                session_id,
+                weights_file,
+                Path(weights_file.name).suffix.lower(),
+                "weights",
+            )
             for uploaded in videos:
-                saved = output_dir / uploaded.name
+                source_name = Path(uploaded.name.replace("\\", "/")).name
+                upload_id = str(getattr(uploaded, "file_id", uploaded.name))
+                saved = video_paths[upload_id]
                 try:
-                    saved.write_bytes(uploaded.getvalue())
                     if not saved.is_file() or saved.stat().st_size == 0:
                         raise ValueError(f"Could not save uploaded video: {uploaded.name}")
-                    metadata = read_video_metadata(saved)
+                    metadata = video_metadata[upload_id]
                     settings = video_settings.get(uploaded.name, {"start": 0.0, "end": float(metadata["duration"])})
                     start_seconds = float(settings.get("start", 0.0))
                     end_seconds = float(settings.get("end", metadata["duration"]))
@@ -1848,6 +2278,9 @@ def _render_detection_mode(session_id: str, data_path: Path) -> None:
                         st.empty(),
                         stop_key,
                         tracking_config=tracking_config,
+                        metadata=metadata,
+                        video_filename=source_name,
+                        weights_hash=weights_hash,
                     )
                     st.session_state["detection_outputs"][uploaded.name] = {
                         "video": str(video_out),
@@ -1856,7 +2289,7 @@ def _render_detection_mode(session_id: str, data_path: Path) -> None:
                             str(
                                 _session_directory(session_id)
                                 / "detection_exports"
-                                / f"{saved.stem}_tracking.json"
+                                / f"{Path(source_name).stem}_tracking.json"
                             )
                             if tracking_config is not None
                             else None
@@ -1922,11 +2355,14 @@ def main() -> None:
 
 
 def _render_dashboard(session_id: str) -> None:
-    try:
-        state = _load_state(session_id)
-    except ValueError as error:
-        st.error(str(error))
-        st.stop()
+    state_key = f"{session_id}:review_state"
+    if state_key not in st.session_state:
+        try:
+            st.session_state[state_key] = _load_state(session_id)
+        except ValueError as error:
+            st.error(str(error))
+            st.stop()
+    state = st.session_state[state_key]
 
     with st.sidebar:
         st.caption(

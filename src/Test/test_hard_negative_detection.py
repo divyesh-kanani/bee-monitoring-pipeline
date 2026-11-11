@@ -7,7 +7,7 @@ import unittest
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import cv2
 import imageio_ffmpeg
@@ -103,15 +103,51 @@ class HardNegativeDetectionTests(unittest.TestCase):
         self.assertEqual(app._supported_weight_extensions("RF-DETR"), ["pth", "pt"])
         self.assertEqual(app._supported_weight_extensions("Ultralytics YOLO"), ["pt"])
         checkpoint = object()
-        with patch.object(
-            app.RFDETRLarge, "from_checkpoint", return_value=checkpoint
-        ) as load_checkpoint:
-            model, class_names = app._load_backend_model(
-                "RF-DETR", Path("fine_tuned.pth"), ["bee", "fly"]
-            )
-        self.assertIs(model, checkpoint)
-        self.assertEqual(class_names, ["bee", "fly"])
-        load_checkpoint.assert_called_once_with("fine_tuned.pth")
+        app._load_backend_model_cached.clear()
+        try:
+            load_checkpoint = MagicMock(return_value=checkpoint)
+            with patch.object(
+                app,
+                "RFDETRLarge",
+                SimpleNamespace(from_checkpoint=load_checkpoint),
+            ):
+                model, class_names = app._load_backend_model(
+                    "RF-DETR", Path("fine_tuned.pth"), ["bee", "fly"]
+                )
+            self.assertIs(model, checkpoint)
+            self.assertEqual(class_names, ["bee", "fly"])
+            load_checkpoint.assert_called_once_with("fine_tuned.pth")
+        finally:
+            app._load_backend_model_cached.clear()
+
+    def test_backend_model_is_loaded_once_for_repeated_video_runs(self):
+        model = FakeYOLOModel()
+        app._load_backend_model_cached.clear()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            weights_path = Path(temporary_directory) / "model.pt"
+            weights_path.write_bytes(b"checkpoint")
+            other_session_weights = Path(temporary_directory) / "other-session-model.pt"
+            other_session_weights.write_bytes(b"checkpoint")
+            try:
+                with patch.object(app, "YOLO", return_value=model) as load_model:
+                    first = app._load_backend_model(
+                        "Ultralytics YOLO",
+                        weights_path,
+                        ["bee"],
+                        weights_hash="same-checkpoint",
+                    )
+                    second = app._load_backend_model(
+                        "Ultralytics YOLO",
+                        other_session_weights,
+                        ["bee"],
+                        weights_hash="same-checkpoint",
+                    )
+
+                self.assertIs(first[0], second[0])
+                self.assertEqual(first[1], ["bee"])
+                load_model.assert_called_once_with(str(weights_path.resolve()))
+            finally:
+                app._load_backend_model_cached.clear()
 
     def test_session_cleanup_isolates_sessions_and_preserves_unrelated_files(self):
         session_id = uuid.uuid4().hex
@@ -250,13 +286,16 @@ class HardNegativeDetectionTests(unittest.TestCase):
                     preview=preview,
                     timestamp_status=status,
                     stop_key=stop_key,
+                    video_filename="sample source.mp4",
                 )
 
             self.assertEqual(model.calls, 3)
             self.assertEqual(len(preview.images), 3)
             self.assertEqual(len(status.messages), 3)
+            self.assertEqual(video_output.name, "sample source_annotated.mp4")
             with csv_output.open(newline="", encoding="utf-8") as csv_file:
                 rows = list(csv.DictReader(csv_file))
+            self.assertEqual(rows[0]["video"], "sample source.mp4")
             self.assertEqual([int(row["frame_number"]) for row in rows], [0, 2, 4])
             self.assertEqual(
                 [float(row["timestamp_seconds"]) for row in rows],

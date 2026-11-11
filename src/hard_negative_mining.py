@@ -10,12 +10,12 @@ from typing import Any
 
 import cv2
 import yaml
-from ultralytics import YOLO
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATA = PROJECT_ROOT / "config" / "YOLOruns.yaml"
 VIDEO_EXTENSIONS = {".avi", ".m4v", ".mkv", ".mov", ".mp4", ".mpeg", ".mpg", ".webm", ".wmv"}
+YOLO = None
 REVIEW_STATUSES = {"unreviewed", "true_positive", "false_positive", "uncertain"}
 REVIEW_FIELDS = (
     "video",
@@ -113,6 +113,11 @@ def run_inference(
         raise FileExistsError(f"Output directory is not empty: {output}")
     output.mkdir(parents=True, exist_ok=True)
 
+    global YOLO
+    if YOLO is None:
+        from ultralytics import YOLO as YOLOClass
+
+        YOLO = YOLOClass
     model = YOLO(str(weights))
     candidate_count = 0
     prediction_path = output / "predictions.csv"

@@ -1,7 +1,10 @@
+import hashlib
+import io
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import cv2
 import numpy as np
@@ -38,15 +41,87 @@ def _detection(
 
 
 class HardNegativeCanvasTests(unittest.TestCase):
-    def test_decision_selection_advances_to_next_unreviewed_then_wraps(self):
-        detections = [
-            {"detection_id": "d1", "status": "unreviewed"},
-            {"detection_id": "d2", "status": "true_positive"},
-            {"detection_id": "d3", "status": "unreviewed"},
-        ]
+    def test_uploaded_file_is_hashed_and_written_only_once_per_upload_id(self):
+        class UploadedFile(io.BytesIO):
+            name = "field clip.mp4"
+            file_id = "unique-upload-id"
+            size = len(b"video bytes")
 
-        self.assertEqual(app._next_unreviewed_detection(detections, "d2"), "d3")
-        self.assertEqual(app._next_unreviewed_detection(detections, "d3"), "d1")
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            session_id = "e50113b750674d78af70f32b6c4df888"
+            cache: dict[str, object] = {}
+            uploaded = UploadedFile(b"video bytes")
+            with patch.object(app, "SESSION_ROOT", Path(temporary_directory)):
+                with patch.object(
+                    app.hashlib, "sha256", wraps=hashlib.sha256
+                ) as digest:
+                    first = app._store_upload(
+                        session_id, uploaded, ".mp4", "videos", cache
+                    )
+                    second = app._store_upload(
+                        session_id, uploaded, ".mp4", "videos", cache
+                    )
+
+            self.assertEqual(first, second)
+            self.assertEqual(digest.call_count, 1)
+            self.assertEqual(first[1].read_bytes(), b"video bytes")
+
+    def test_empty_upload_rerun_does_not_save_unchanged_review_state(self):
+        state = {"videos": {}}
+        with patch.object(app, "_save_state") as save_state:
+            self.assertEqual(app._upload_videos("session-id", state, []), [])
+        save_state.assert_not_called()
+
+    def test_review_frame_image_cache_decodes_once_and_keeps_source_resolution(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            image_path = Path(temporary_directory) / "frame.jpg"
+            original = np.full((1080, 1920, 3), 80, dtype=np.uint8)
+            self.assertTrue(cv2.imwrite(str(image_path), original))
+            frame = {"frame_id": "frame-1", "image_path": str(image_path)}
+            cache: dict[str, object] = {}
+
+            with patch.object(app.cv2, "imread", wraps=cv2.imread) as imread:
+                first = app._review_frame_images(frame, cache)
+                second = app._review_frame_images(frame, cache)
+
+            self.assertIs(first, second)
+            self.assertEqual(imread.call_count, 1)
+            self.assertEqual(first["image"].shape, (1080, 1920, 3))
+            self.assertEqual(first["display_bgr"].shape[:2], (405, 720))
+
+    def test_video_preview_cache_reuses_sampled_frames(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            video_path = Path(temporary_directory) / "video.mp4"
+            video_path.write_bytes(b"video")
+            cache: dict[str, object] = {}
+            frames = [np.zeros((1080, 1920, 3), dtype=np.uint8)]
+            with patch.object(app, "preview_frames", return_value=frames) as decode:
+                first = app._cached_video_previews(
+                    video_path, 0, 100, 4, cache, "video-1"
+                )
+                second = app._cached_video_previews(
+                    video_path, 0, 100, 4, cache, "video-1"
+                )
+
+            self.assertIs(first, second)
+            self.assertEqual(decode.call_count, 1)
+            self.assertEqual(first[0].shape, (405, 720, 3))
+
+    def test_review_preview_scales_boxes_without_changing_original_coordinates(self):
+        image = np.zeros((50, 50, 3), dtype=np.uint8)
+        detections = [_detection("d1", "unreviewed", (20, 20, 80, 80), "")]
+
+        preview = app._review_image(
+            image, detections, set(), coordinate_scale=(0.5, 0.5)
+        )
+
+        self.assertEqual(preview.shape, (50, 50, 3))
+        self.assertTrue(np.array_equal(preview[40, 25], (140, 105, 0)))
+
+    def test_review_display_is_larger_and_preserves_aspect_ratio(self):
+        self.assertEqual(app._review_display_size(1920, 1080), (720, 405))
+        self.assertEqual(app._review_display_size(640, 360), (640, 360))
+        self.assertEqual(app._review_display_size(900, 1600), (360, 640))
 
     def test_initial_canvas_includes_editable_boxes_for_every_review_status(self):
         frame = {
@@ -83,6 +158,251 @@ class HardNegativeCanvasTests(unittest.TestCase):
         self.assertTrue(np.array_equal(preview[5, 5], (25, 105, 25)))
         self.assertTrue(np.array_equal(preview[5, 40], (45, 45, 225)))
         self.assertTrue(np.array_equal(preview[5, 75], (0, 116, 140)))
+
+    def test_number_one_selection_highlights_only_its_detection(self):
+        image = np.zeros((120, 120, 3), dtype=np.uint8)
+        detections = [
+            _detection("d1", "unreviewed", (5, 40, 35, 90), ""),
+            _detection("d2", "unreviewed", (60, 40, 90, 90), ""),
+        ]
+
+        preview = app._review_image(image, detections, {"d1"})
+
+        self.assertTrue(np.array_equal(preview[70, 5], (255, 190, 0)))
+        self.assertTrue(np.array_equal(preview[70, 90], (140, 105, 0)))
+
+    def test_canvas_click_selects_the_correct_box_after_scaling(self):
+        detections = [
+            _detection("d1", "unreviewed", (10, 10, 80, 80), ""),
+            _detection("d2", "unreviewed", (120, 20, 200, 100), ""),
+            _detection("d3", "unreviewed", (240, 60, 340, 160), ""),
+        ]
+        point = app._canvas_point_coordinates(
+            {"type": "circle", "left": 119, "top": 45, "radius": 1, "strokeWidth": 0}
+        )
+
+        self.assertEqual(point, (120, 45))
+        self.assertEqual(
+            app._detection_at_canvas_point(
+                detections, *point, 200, 100, 400, 200
+            ),
+            "d3",
+        )
+        self.assertIsNone(
+            app._detection_at_canvas_point(detections, 105, 5, 200, 100, 400, 200)
+        )
+
+    def test_batch_selection_is_separate_from_status_and_reject_targets_only_id(self):
+        statuses = {f"d{number}": "unreviewed" for number in range(1, 11)}
+        selected_ids = {"d4", "d5", "d7"}
+
+        app._stage_detection_decision(statuses, {"d5"}, "false_positive")
+
+        self.assertEqual(statuses["d5"], "false_positive")
+        self.assertEqual(statuses["d4"], "unreviewed")
+        self.assertEqual(statuses["d7"], "unreviewed")
+        self.assertEqual(selected_ids, {"d4", "d5", "d7"})
+
+    def test_deleting_selected_detection_removes_only_that_id(self):
+        frame = {
+            "annotation_complete": True,
+            "detections": [
+                _detection("d4", "true_positive", (1, 1, 5, 5), ""),
+                _detection("d5", "false_positive", (10, 10, 15, 15), ""),
+            ],
+        }
+        statuses = {"d4": "true_positive", "d5": "false_positive"}
+
+        app._delete_detections(frame, {"d5"}, statuses)
+
+        self.assertEqual(
+            [detection["detection_id"] for detection in frame["detections"]], ["d4"]
+        )
+        self.assertEqual(statuses, {"d4": "true_positive"})
+        self.assertFalse(frame["annotation_complete"])
+
+    def test_batch_decision_for_ten_detections_is_explicit_and_editable(self):
+        detections = [
+            _detection(f"d{number}", "unreviewed", (number, 1, number + 1, 3), "")
+            for number in range(1, 11)
+        ]
+        frame = {
+            "frame_id": "video-a_000000001",
+            "width": 200,
+            "height": 100,
+            "annotation_complete": False,
+            "detections": detections,
+        }
+        drawing, stroke_map, _ = app._canvas_drawing(frame, 200, 100)
+        staged = {detection["detection_id"]: detection["status"] for detection in detections}
+        false_positives = {"d1", "d5", "d6", "d7", "d9"}
+        app._stage_detection_decision(staged, false_positives, "false_positive")
+        app._stage_detection_decision(staged, {"d1"}, "true_positive")
+        self.assertEqual(staged["d1"], "true_positive")
+        app._stage_detection_decision(
+            staged,
+            {
+                detection["detection_id"]
+                for detection in detections
+                if staged[detection["detection_id"]] == "unreviewed"
+            },
+            "true_positive",
+        )
+        false_positives.remove("d1")
+
+        with self.assertRaisesRegex(ValueError, "still unreviewed"):
+            app._commit_frame_review(
+                frame,
+                {**staged, "d10": "unreviewed"},
+                drawing["objects"],
+                stroke_map,
+                {stroke: 0 for stroke in stroke_map},
+                1,
+                1,
+                ["bee", "fly"],
+                True,
+            )
+        self.assertTrue(all(detection["status"] == "unreviewed" for detection in detections))
+
+        app._commit_frame_review(
+            frame,
+            staged,
+            drawing["objects"],
+            stroke_map,
+            {stroke: 0 for stroke in stroke_map},
+            1,
+            1,
+            ["bee", "fly"],
+            True,
+        )
+        self.assertEqual(
+            [detection["status"] for detection in detections],
+            [
+                "false_positive"
+                if detection["detection_id"] in false_positives
+                else "true_positive"
+                for detection in detections
+            ],
+        )
+        self.assertTrue(frame["annotation_complete"])
+
+    def test_save_frame_assigns_unique_ids_to_multiple_manual_boxes(self):
+        frame = {
+            "frame_id": "video-a_000000001",
+            "width": 200,
+            "height": 100,
+            "annotation_complete": False,
+            "detections": [
+                _detection("d1", "true_positive", (5, 5, 25, 25), "#112233")
+            ],
+        }
+        drawing, stroke_map, _ = app._canvas_drawing(frame, 200, 100)
+        shapes = list(drawing["objects"])
+        shapes.extend(
+            [
+                {
+                    "type": "rect",
+                    "stroke": "#aabbcc",
+                    "left": 40,
+                    "top": 10,
+                    "width": 20,
+                    "height": 15,
+                    "scaleX": 1,
+                    "scaleY": 1,
+                    "angle": 0,
+                },
+                {
+                    "type": "rect",
+                    "stroke": "#ddeeff",
+                    "left": 90,
+                    "top": 20,
+                    "width": 15,
+                    "height": 10,
+                    "scaleX": 1,
+                    "scaleY": 1,
+                    "angle": 0,
+                },
+            ]
+        )
+
+        app._commit_frame_review(
+            frame,
+            {"d1": "true_positive"},
+            shapes,
+            stroke_map,
+            {"#112233": 0, "#aabbcc": 1, "#ddeeff": 0},
+            1,
+            1,
+            ["bee", "fly"],
+            True,
+        )
+
+        manual = [detection for detection in frame["detections"] if detection["manual"]]
+        self.assertEqual(
+            [detection["detection_id"] for detection in manual],
+            ["video-a_000000001-manual001", "video-a_000000001-manual002"],
+        )
+        self.assertEqual([detection["class_id"] for detection in manual], [1, 0])
+        self.assertTrue(all(detection["status"] == "true_positive" for detection in manual))
+
+    def test_deleted_all_detections_can_export_only_as_a_confirmed_empty_label(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            frames = []
+            for video_id in ("video-a", "video-b", "video-c"):
+                image_path = root / f"{video_id}.jpg"
+                self.assertTrue(
+                    cv2.imwrite(
+                        str(image_path), np.zeros((40, 80, 3), dtype=np.uint8)
+                    )
+                )
+                frames.append(
+                    {
+                        "frame_id": f"{video_id}_000000001",
+                        "video_id": video_id,
+                        "video_filename": f"{video_id}.mp4",
+                        "frame_number": 1,
+                        "timestamp_seconds": 0.1,
+                        "image_path": str(image_path),
+                        "width": 80,
+                        "height": 40,
+                        "annotation_complete": True,
+                        "detections": (
+                            []
+                            if video_id == "video-a"
+                            else [
+                                _detection(
+                                    f"{video_id}-bee",
+                                    "true_positive",
+                                    (5, 5, 20, 20),
+                                    "#112233",
+                                )
+                            ]
+                        ),
+                    }
+                )
+
+            dataset_dir, split_counts = create_dataset(
+                frames, ["bee", "fly"], root / "export", seed=1
+            )
+
+            self.assertEqual(sum(split_counts.values()), 3)
+            empty_label = next(
+                (dataset_dir / "labels").rglob("video-a_000000001.txt")
+            )
+            self.assertEqual(empty_label.read_text(encoding="utf-8"), "")
+
+    def test_side_by_side_preview_preserves_original_and_frame_dimensions(self):
+        image = np.zeros((120, 240, 3), dtype=np.uint8)
+        original = image.copy()
+        detections = [_detection("d1", "unreviewed", (40, 35, 100, 90), "")]
+
+        preview = app._review_image(image, detections, set())
+
+        self.assertEqual(preview.shape, image.shape)
+        self.assertTrue(np.array_equal(image, original))
+        self.assertGreater(np.count_nonzero(preview), 0)
+        self.assertTrue(np.any(np.all(preview[:, :, :] == (255, 255, 255), axis=2)))
 
     def test_move_resize_add_delete_and_class_correction_map_to_original_pixels(self):
         frame = {
@@ -135,6 +455,7 @@ class HardNegativeCanvasTests(unittest.TestCase):
         )
 
         edited = frame["detections"][0]
+        self.assertEqual(edited["detection_id"], "video-a_000000001-d001")
         self.assertEqual(edited["class_id"], 1)
         self.assertEqual(edited["class_name"], "fly")
         self.assertEqual(
