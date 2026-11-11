@@ -1,5 +1,7 @@
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 import uuid
@@ -14,6 +16,82 @@ from src.hard_negative_mining import _read_class_names
 
 
 class HardNegativeAppTests(unittest.TestCase):
+    def test_dashboard_imports_when_started_from_its_source_directory(self):
+        project_root = Path(__file__).resolve().parents[2]
+        app_file = project_root / "src" / "hard_negative_app.py"
+        script = (
+            "import runpy, sys; "
+            "src, app = sys.argv[1:]; "
+            "sys.path = [src, *[path for path in sys.path[1:] "
+            "if path and path != app.rsplit('/src/', 1)[0]]]; "
+            "runpy.run_path(app, run_name='import_probe')"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script, str(app_file.parent), str(app_file)],
+            cwd=app_file.parent,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_detection_mode_offers_optional_bytetrack_and_parameters(self):
+        project_root = Path(__file__).resolve().parents[2]
+        app_file = project_root / "src" / "hard_negative_app.py"
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            sample_path = Path(temporary_directory) / "sample.mp4"
+            writer = cv2.VideoWriter(
+                str(sample_path), cv2.VideoWriter_fourcc(*"mp4v"), 5, (64, 48)
+            )
+            self.assertTrue(writer.isOpened())
+            for frame_number in range(5):
+                writer.write(
+                    np.full((48, 64, 3), frame_number * 30, dtype=np.uint8)
+                )
+            writer.release()
+
+            with patch.dict(
+                os.environ,
+                {"BEE_MINING_DATA_DIR": str(Path(temporary_directory) / "sessions")},
+            ):
+                app = AppTest.from_file(str(app_file)).run(timeout=30)
+                app.radio[0].set_value("Detection").run(timeout=30)
+                videos = next(
+                    uploader for uploader in app.file_uploader if uploader.label == "Videos"
+                )
+                videos.set_value(
+                    ("sample.mp4", sample_path.read_bytes(), "video/mp4")
+                ).run(timeout=30)
+
+                self.assertFalse(app.exception)
+                tracking_checkbox = next(
+                    checkbox
+                    for checkbox in app.checkbox
+                    if checkbox.label == "Apply object tracking after detection"
+                )
+                tracking_checkbox.set_value(True).run(timeout=30)
+
+                self.assertFalse(app.exception)
+                algorithm = next(
+                    selectbox
+                    for selectbox in app.selectbox
+                    if selectbox.label == "Tracking algorithm"
+                )
+                self.assertEqual(algorithm.options, ["ByteTrack"])
+                self.assertTrue(
+                    any(
+                        number.label == "Track buffer (frames)"
+                        for number in app.number_input
+                    )
+                )
+                self.assertTrue(
+                    any(
+                        button.label == "Start detection and tracking"
+                        for button in app.button
+                    )
+                )
+
     def test_browser_reload_clears_the_previous_session_directory(self):
         project_root = Path(__file__).resolve().parents[2]
         app_file = project_root / "src" / "hard_negative_app.py"

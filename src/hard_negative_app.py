@@ -7,6 +7,8 @@ import os
 import re
 import shutil
 import subprocess
+import sys
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -17,6 +19,10 @@ import numpy as np
 import streamlit as st
 import yaml
 from ultralytics import YOLO
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 try:
     from rfdetr import RFDETRLarge
@@ -37,12 +43,14 @@ from hard_negative_review import (
     sampled_frame_numbers,
     zip_directory,
 )
+from tracking.detector import Detection
+from tracking.tracker import Tracker as ByteTracker
+from tracking.video_utils import draw_tracks
 
 
 SESSION_ROOT = Path(
     os.environ.get(
-        "BEE_MINING_DATA_DIR",
-        str(Path(__file__).resolve().parents[1] / "hard_negative_sessions"),
+        "BEE_MINING_DATA_DIR", str(PROJECT_ROOT / "hard_negative_sessions")
     )
 ).expanduser()
 VIDEO_TYPES = sorted(suffix.lstrip(".") for suffix in VIDEO_EXTENSIONS)
@@ -919,6 +927,7 @@ def _run_detection_backend(
     preview: Any,
     timestamp_status: Any,
     stop_key: str,
+    tracking_config: dict[str, Any] | None = None,
 ) -> tuple[Path, Path]:
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -931,14 +940,17 @@ def _run_detection_backend(
         metadata["fps"],
         metadata["total_frames"],
     )
-    step = frames_to_skip + 1
+    step = 1 if tracking_config is not None else frames_to_skip + 1
     total_selected = max(0, (end_frame - start_frame + step - 1) // step)
     output_dir = _session_directory(session_id) / "detection_exports"
     output_dir.mkdir(parents=True, exist_ok=True)
     title = video_path.stem
-    video_output = output_dir / f"{title}_annotated.mp4"
+    video_output = output_dir / (
+        f"{title}_tracked.mp4" if tracking_config is not None else f"{title}_annotated.mp4"
+    )
     temporary_video = output_dir / f"{title}_temporary.mp4"
     csv_output = output_dir / f"{title}_detections.csv"
+    tracking_summary_path = output_dir / f"{title}_tracking.json"
     temporary_video.unlink(missing_ok=True)
     writer = None
     try:
@@ -971,8 +983,13 @@ def _run_detection_backend(
             "y1",
             "x2",
             "y2",
-        )
+        ) + (("track_id",) if tracking_config is not None else ())
         processed = 0
+        detection_count = 0
+        tracked_detection_count = 0
+        tracker = ByteTracker(tracking_config) if tracking_config is not None else None
+        tracks_by_id: dict[int, dict[str, int]] = {}
+        tracking_started = time.perf_counter()
         with csv_output.open("w", newline="", encoding="utf-8") as csv_file:
             csv_writer = csv.DictWriter(csv_file, fieldnames=columns)
             csv_writer.writeheader()
@@ -991,16 +1008,58 @@ def _run_detection_backend(
                         iou,
                         image_size,
                     )
-                    annotated = _draw_detection_overlay(frame, normalized, model_names)
+                    detection_count += len(normalized)
+                    if tracker is not None:
+                        tracked = tracker.update(
+                            [
+                                Detection(
+                                    xyxy=(
+                                        item["x1"],
+                                        item["y1"],
+                                        item["x2"],
+                                        item["y2"],
+                                    ),
+                                    confidence=item["confidence"],
+                                    class_id=item["class_id"],
+                                    class_name=item["class_name"],
+                                )
+                                for item in normalized
+                            ],
+                            frame.shape[:2],
+                        )
+                        annotated = draw_tracks(frame, tracked)
+                        tracked_detection_count += len(tracked)
+                        track_ids_by_detection = {
+                            item.detection_index: item.tracker_id for item in tracked
+                        }
+                        for item in tracked:
+                            record = tracks_by_id.setdefault(
+                                item.tracker_id,
+                                {
+                                    "first_frame": frame_counter,
+                                    "last_frame": frame_counter,
+                                    "frames_tracked": 0,
+                                },
+                            )
+                            record["last_frame"] = frame_counter
+                            record["frames_tracked"] += 1
+                    else:
+                        annotated = _draw_detection_overlay(frame, normalized, model_names)
+                        track_ids_by_detection = {}
                     timestamp = frame_counter / metadata["fps"]
-                    for item in normalized:
+                    for detection_index, item in enumerate(normalized):
+                        row = {
+                            "video": video_path.name,
+                            "frame_number": frame_counter,
+                            "timestamp_seconds": timestamp,
+                            **item,
+                        }
+                        if tracker is not None:
+                            row["track_id"] = track_ids_by_detection.get(
+                                detection_index, ""
+                            )
                         csv_writer.writerow(
-                            {
-                                "video": video_path.name,
-                                "frame_number": frame_counter,
-                                "timestamp_seconds": timestamp,
-                                **item,
-                            }
+                            row
                         )
                     processed += 1
                     progress.progress(
@@ -1031,6 +1090,7 @@ def _run_detection_backend(
         cap.release()
         temporary_video.unlink(missing_ok=True)
         csv_output.unlink(missing_ok=True)
+        tracking_summary_path.unlink(missing_ok=True)
         raise
     finally:
         if writer is not None:
@@ -1040,6 +1100,43 @@ def _run_detection_backend(
         _transcode_mp4(temporary_video, video_output)
     finally:
         temporary_video.unlink(missing_ok=True)
+    if tracking_config is not None:
+        elapsed = time.perf_counter() - tracking_started
+        track_durations = [
+            (record["last_frame"] - record["first_frame"] + 1) / metadata["fps"]
+            for record in tracks_by_id.values()
+        ]
+        tracking_summary = {
+            "algorithm": "ByteTrack",
+            "total_unique_track_ids": len(tracks_by_id),
+            "detections": detection_count,
+            "tracked_detections": tracked_detection_count,
+            "frames_processed": processed,
+            "processing_fps": processed / elapsed if elapsed > 0 else 0.0,
+            "track_durations_seconds": {
+                "min": min(track_durations) if track_durations else 0.0,
+                "max": max(track_durations) if track_durations else 0.0,
+            },
+            "tracks": [
+                {
+                    "track_id": track_id,
+                    **record,
+                    "duration_seconds": (
+                        record["last_frame"] - record["first_frame"] + 1
+                    )
+                    / metadata["fps"],
+                }
+                for track_id, record in sorted(tracks_by_id.items())
+            ],
+            "identity_note": (
+                "Track IDs are temporary labels within this video, not biological bee identities."
+            ),
+        }
+        tracking_summary_path.write_text(
+            json.dumps(tracking_summary, indent=2), encoding="utf-8"
+        )
+    else:
+        tracking_summary_path.unlink(missing_ok=True)
     del model
     return video_output, csv_output
 
@@ -1105,7 +1202,97 @@ def _render_detection_mode(session_id: str, data_path: Path) -> None:
         iou = 0.7
         st.caption("RF-DETR uses its checkpoint's post-processing; an IoU threshold is not exposed by its inference API.")
     image_size = st.number_input("Image size", min_value=128, max_value=2048, value=960, step=32, key=f"{session_id}:detection_imgsz")
-    skip_frames = st.number_input("Frames to skip between processed frames", min_value=0, max_value=1000, value=29, step=1, key=f"{session_id}:detection_skip")
+    apply_tracking = st.checkbox(
+        "Apply object tracking after detection",
+        value=False,
+        key=f"{session_id}:apply_tracking",
+        help="Add persistent short-term IDs to detections and create a tracked video.",
+    )
+    skip_frames = st.number_input(
+        "Frames to skip between processed frames",
+        min_value=0,
+        max_value=1000,
+        value=29,
+        step=1,
+        key=f"{session_id}:detection_skip",
+        disabled=apply_tracking,
+    )
+    tracking_config = None
+    if apply_tracking:
+        st.caption(
+            "Tracking runs detection on every frame in the selected time range so "
+            "ByteTrack can maintain IDs. This can take longer than detection alone."
+        )
+        with st.expander("Tracking options", expanded=True):
+            algorithm = st.selectbox(
+                "Tracking algorithm",
+                ["ByteTrack"],
+                key=f"{session_id}:tracking_algorithm",
+            )
+            low_threshold = st.slider(
+                "Low detection threshold",
+                0.0,
+                0.99,
+                0.25,
+                0.01,
+                key=f"{session_id}:tracking_low_threshold",
+                help="Minimum score used for ByteTrack's second, low-confidence matching pass.",
+            )
+            high_threshold = st.slider(
+                "High detection threshold",
+                0.01,
+                1.0,
+                0.5,
+                0.01,
+                key=f"{session_id}:tracking_high_threshold",
+                help="Score boundary for ByteTrack's first matching pass.",
+            )
+            activation_threshold = st.slider(
+                "Track activation threshold",
+                0.01,
+                1.0,
+                0.5,
+                0.01,
+                key=f"{session_id}:tracking_activation_threshold",
+                help="Minimum score for starting a new track.",
+            )
+            track_buffer = st.number_input(
+                "Track buffer (frames)",
+                min_value=1,
+                max_value=1000,
+                value=30,
+                step=1,
+                key=f"{session_id}:tracking_buffer",
+                help="How many frames a temporarily missed track is kept alive.",
+            )
+            matching_threshold = st.slider(
+                "Matching threshold",
+                0.0,
+                1.0,
+                0.8,
+                0.01,
+                key=f"{session_id}:tracking_matching_threshold",
+                help="Controls how readily detections are associated with existing tracks.",
+            )
+        tracking_config = {
+            "algorithm": algorithm,
+            "low_detection_threshold": low_threshold,
+            "high_detection_threshold": high_threshold,
+            "track_activation_threshold": activation_threshold,
+            "track_buffer": int(track_buffer),
+            "matching_threshold": matching_threshold,
+        }
+        if conf > low_threshold:
+            st.info(
+                "For ByteTrack's low-confidence recovery, set the detection "
+                "confidence threshold no higher than the low detection threshold."
+            )
+        if low_threshold >= high_threshold:
+            st.error("The low detection threshold must be lower than the high threshold.")
+        if activation_threshold < high_threshold:
+            st.error(
+                "The track activation threshold must be at least the high detection threshold."
+            )
     class_names = _read_class_names(data_path)
     video_settings: dict[str, dict[str, float]] = {}
     for uploaded in videos:
@@ -1138,11 +1325,19 @@ def _render_detection_mode(session_id: str, data_path: Path) -> None:
     if "detection_outputs" not in st.session_state:
         st.session_state["detection_outputs"] = {}
 
-    if st.button("Start detection", type="primary", key=f"{session_id}:start_detection"):
+    start_label = (
+        "Start detection and tracking" if apply_tracking else "Start detection"
+    )
+    if st.button(start_label, type="primary", key=f"{session_id}:start_detection"):
         if weights_file is None:
             st.error("Please upload a trained model before starting detection.")
         elif Path(weights_file.name).suffix.lower().lstrip(".") not in _supported_weight_extensions(model_type):
             st.error("The selected model backend does not support this checkpoint extension.")
+        elif apply_tracking and (
+            low_threshold >= high_threshold
+            or activation_threshold < high_threshold
+        ):
+            st.error("Correct the ByteTrack thresholds before starting.")
         else:
             st.session_state[stop_key] = False
             st.session_state["detection_outputs"] = {}
@@ -1178,10 +1373,20 @@ def _render_detection_mode(session_id: str, data_path: Path) -> None:
                         st.empty(),
                         st.empty(),
                         stop_key,
+                        tracking_config=tracking_config,
                     )
                     st.session_state["detection_outputs"][uploaded.name] = {
                         "video": str(video_out),
                         "csv": str(csv_out),
+                        "tracking_summary": (
+                            str(
+                                _session_directory(session_id)
+                                / "detection_exports"
+                                / f"{saved.stem}_tracking.json"
+                            )
+                            if tracking_config is not None
+                            else None
+                        ),
                     }
                 except Exception as error:
                     st.error(f"{uploaded.name}: {error}")
@@ -1197,6 +1402,23 @@ def _render_detection_mode(session_id: str, data_path: Path) -> None:
                 st.subheader(name)
                 st.video(str(payload["video"]), format="video/mp4")
                 video_path = Path(payload["video"])
+                summary_value = payload.get("tracking_summary")
+                if summary_value and Path(summary_value).is_file():
+                    summary_path = Path(summary_value)
+                    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+                    st.caption(
+                        f"ByteTrack · {summary['total_unique_track_ids']} unique track IDs · "
+                        f"{summary['frames_processed']} frames processed · "
+                        f"{summary['processing_fps']:.2f} processing FPS"
+                    )
+                    st.caption(summary["identity_note"])
+                    st.download_button(
+                        f"Download tracking summary for {name}",
+                        data=summary_path.read_bytes(),
+                        file_name=summary_path.name,
+                        mime="application/json",
+                        key=f"{session_id}:download_tracking_summary_{name}",
+                    )
                 st.download_button(
                     f"Download annotated MP4 for {name}",
                     data=lambda path=video_path: path.read_bytes(),

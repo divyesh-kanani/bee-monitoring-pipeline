@@ -1,3 +1,4 @@
+import json
 import sys
 import subprocess
 import csv
@@ -225,6 +226,70 @@ class HardNegativeDetectionTests(unittest.TestCase):
             self.assertTrue(capture.isOpened())
             self.assertEqual(int(capture.get(cv2.CAP_PROP_FRAME_COUNT)), 5)
             capture.release()
+
+    def test_video_runner_applies_bytetrack_to_every_frame(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "sample.mp4"
+            writer = cv2.VideoWriter(
+                str(source), cv2.VideoWriter_fourcc(*"mp4v"), 5, (64, 48)
+            )
+            self.assertTrue(writer.isOpened())
+            for frame_number in range(10):
+                writer.write(
+                    np.full((48, 64, 3), frame_number * 20, dtype=np.uint8)
+                )
+            writer.release()
+
+            model = FakeYOLOModel()
+            stop_key = "tracking-test:stop"
+            tracking_config = {
+                "algorithm": "ByteTrack",
+                "low_detection_threshold": 0.25,
+                "high_detection_threshold": 0.5,
+                "track_activation_threshold": 0.5,
+                "track_buffer": 30,
+                "matching_threshold": 0.8,
+            }
+            with (
+                patch.object(app, "SESSION_ROOT", root),
+                patch.object(app, "_load_backend_model", return_value=(model, ["bee"])),
+                patch.object(app.st, "session_state", {stop_key: False}),
+            ):
+                video_output, csv_output = app._run_detection_backend(
+                    "tracking-test",
+                    "Ultralytics YOLO",
+                    root / "weights.pt",
+                    source,
+                    ["bee"],
+                    start_seconds=0,
+                    end_seconds=2,
+                    frames_to_skip=4,
+                    confidence=0.25,
+                    iou=0.7,
+                    image_size=640,
+                    progress=FakeProgress(),
+                    preview=FakePreview(),
+                    timestamp_status=FakeStatus(),
+                    stop_key=stop_key,
+                    tracking_config=tracking_config,
+                )
+
+            self.assertEqual(model.calls, 10)
+            self.assertTrue(video_output.name.endswith("_tracked.mp4"))
+            capture = cv2.VideoCapture(str(video_output))
+            self.assertTrue(capture.isOpened())
+            self.assertEqual(int(capture.get(cv2.CAP_PROP_FRAME_COUNT)), 10)
+            capture.release()
+            with csv_output.open(newline="", encoding="utf-8") as csv_file:
+                rows = list(csv.DictReader(csv_file))
+            self.assertIn("track_id", rows[0])
+            self.assertEqual(len(rows), 10)
+            self.assertTrue(any(row["track_id"] for row in rows))
+            summary_path = video_output.with_name("sample_tracking.json")
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            self.assertEqual(summary["frames_processed"], 10)
+            self.assertEqual(summary["total_unique_track_ids"], 1)
 
 
 if __name__ == "__main__":

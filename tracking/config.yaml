@@ -1,0 +1,22 @@
+detection:
+  model_type: YOLO # YOLO or RF-DETR
+  weights: models/yolo26x.pt # Relative to the repository root
+  confidence_threshold: 0.1 # Minimum score passed to ByteTrack
+  nms_iou_threshold: 0.7 # YOLO NMS threshold; RF-DETR does not use NMS
+  image_size: 960 # Inference side length in pixels
+  device: auto # auto, cpu, cuda:0, or a YOLO device index such as "0"
+  class_names: null # Optional class names by class ID, mainly for RF-DETR
+
+tracking:
+  algorithm: ByteTrack # Currently only ByteTrack is implemented
+  high_detection_threshold: 0.25 # First-stage association score threshold
+  low_detection_threshold: 0.1 # Second-stage association score threshold
+  track_activation_threshold: 0.25 # Minimum score for starting a new track
+  track_buffer: 30 # Frames to keep a temporarily lost track alive
+  matching_threshold: 0.8 # First-stage association threshold
+
+video:
+  input_path: videos/RIMG0006 (1).MOV # Relative to the repository root
+  output_path: tracking/output_videos/RIMG0006_tracked.mp4 # Relative to the repository root
+  display: false # Show the annotated video in a window
+  output_fps: null # Null preserves the source video FPS

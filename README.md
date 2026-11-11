@@ -106,6 +106,14 @@ Choose **Detection** for normal inference or **Hard-negative mining** for annota
 review. Upload YOLO `.pt` weights or RF-DETR `.pth` weights, then select your videos.
 Detection exports a browser-compatible H.264 MP4 and a prediction CSV.
 
+To include tracking, enable **Apply object tracking after detection** in
+Detection mode, select **ByteTrack**, and adjust its thresholds and track buffer
+under **Tracking options**. Start **detection and tracking** to view and download
+the tracked MP4, a detection CSV with track IDs, and a tracking summary.
+Tracking processes every frame in the selected time range; detection-only frame
+skipping is disabled to keep track IDs consistent. Track IDs are short-term
+labels, not biological bee identities.
+
 The app runs locally on `127.0.0.1` and stores session data under
 `hard_negative_sessions/`. For HPC, use an SSH tunnel instead of exposing it
 publicly.
