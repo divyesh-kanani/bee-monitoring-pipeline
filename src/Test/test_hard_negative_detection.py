@@ -113,31 +113,71 @@ class HardNegativeDetectionTests(unittest.TestCase):
         self.assertEqual(class_names, ["bee", "fly"])
         load_checkpoint.assert_called_once_with("fine_tuned.pth")
 
-    def test_session_cleanup_removes_session_uploads_and_exports(self):
+    def test_session_cleanup_isolates_sessions_and_preserves_unrelated_files(self):
         session_id = uuid.uuid4().hex
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             session = root / session_id
             other_session = root / uuid.uuid4().hex
-            old_exports = root / "detection_exports" / session_id
-            old_previews = root / "detection_preview" / session_id
-            legacy_export = root / "detection_exports" / "old-random-output"
-            for path in (session, other_session, old_exports, old_previews):
+            dataset = root / "original_dataset"
+            model = root / "original_model.pt"
+            for path in (session, other_session, dataset):
                 path.mkdir(parents=True)
                 (path / "temporary.bin").write_bytes(b"temporary")
-            legacy_export.mkdir()
-            (legacy_export / "old-video.mp4").write_bytes(b"temporary")
+            model.write_bytes(b"model")
 
             with patch.object(app, "SESSION_ROOT", root):
                 app._clear_session_data(session_id)
-                app._clear_other_session_data()
-                app._clear_legacy_detection_data()
 
             self.assertFalse(session.exists())
-            self.assertFalse(other_session.exists())
-            self.assertFalse(old_exports.exists())
-            self.assertFalse(old_previews.exists())
-            self.assertFalse(legacy_export.exists())
+            self.assertTrue(other_session.exists())
+            self.assertTrue(dataset.exists())
+            self.assertEqual(model.read_bytes(), b"model")
+
+    def test_abandoned_sessions_expire_without_removing_active_or_unrelated_paths(self):
+        stale_id = uuid.uuid4().hex
+        active_id = uuid.uuid4().hex
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            stale = root / stale_id
+            active = root / active_id
+            unrelated = root / "keep-me"
+            for directory in (stale, active, unrelated):
+                directory.mkdir()
+                (directory / ".activity").touch()
+            old_timestamp = 100.0
+            for directory in (stale,):
+                (directory / ".activity").touch()
+                import os
+                os.utime(directory / ".activity", (old_timestamp, old_timestamp))
+
+            with (
+                patch.object(app, "SESSION_ROOT", root),
+                patch.object(app, "SESSION_MAX_AGE_SECONDS", 60),
+                app._session_access(active_id),
+            ):
+                removed = app._cleanup_abandoned_sessions(now=200.0)
+
+            self.assertEqual(removed, 1)
+            self.assertFalse(stale.exists())
+            self.assertTrue(active.exists())
+            self.assertTrue(unrelated.exists())
+
+    def test_download_reads_artifact_into_memory_then_deletes_only_that_file(self):
+        session_id = uuid.uuid4().hex
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            session = root / session_id
+            session.mkdir()
+            artifact = session / "dataset.zip"
+            artifact.write_bytes(b"zip bytes")
+            upload = session / "source.mp4"
+            upload.write_bytes(b"keep until session cleanup")
+            with patch.object(app, "SESSION_ROOT", root):
+                contents = app._read_then_delete(artifact, session_id)
+            self.assertEqual(contents, b"zip bytes")
+            self.assertFalse(artifact.exists())
+            self.assertTrue(upload.exists())
 
     def test_transcoded_mp4_is_h264_and_playable_by_opencv(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -195,7 +235,7 @@ class HardNegativeDetectionTests(unittest.TestCase):
                 patch.object(app.st, "session_state", {stop_key: False}),
             ):
                 video_output, csv_output = app._run_detection_backend(
-                    "test-session",
+                    uuid.uuid4().hex,
                     "Ultralytics YOLO",
                     root / "weights.pt",
                     source,
@@ -257,7 +297,7 @@ class HardNegativeDetectionTests(unittest.TestCase):
                 patch.object(app.st, "session_state", {stop_key: False}),
             ):
                 video_output, csv_output = app._run_detection_backend(
-                    "tracking-test",
+                    uuid.uuid4().hex,
                     "Ultralytics YOLO",
                     root / "weights.pt",
                     source,

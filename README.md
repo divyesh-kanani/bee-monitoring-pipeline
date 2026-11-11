@@ -115,8 +115,8 @@ skipping is disabled to keep track IDs consistent. Track IDs are short-term
 labels, not biological bee identities.
 
 The app runs locally on `127.0.0.1` and stores session data under
-`hard_negative_sessions/`. For HPC, use an SSH tunnel instead of exposing it
-publicly.
+the operating system's temporary directory, isolated by session. For HPC, use an
+SSH tunnel instead of exposing it publicly.
 
 ### Interactive hard-negative review app
 
@@ -126,14 +126,12 @@ start/end times and frames to skip (0 processes every frame; 29 processes every
 frames before inference. Confidence, IoU, and image size are shared detection
 settings.
 
-Review individual detections, not whole frames: select a box, correct its class
-or pixel coordinates, then keep, reject, or mark it uncertain. Use **Undo
-decision** to restore its previous status. Add missed insects before confirming
-that every target insect in the frame has been annotated. A frame containing an
-unreviewed or uncertain detection, or lacking this whole-frame confirmation, is
-excluded from dataset export. Only accepted boxes are written to labels;
-rejected boxes are omitted, and an empty label is created for a confirmed
-background-only frame.
+Review each detection individually. Draw rectangles directly on the frame, choose
+a class for every box, then switch to select mode to move or resize them. Delete
+incorrect boxes, or draw additional boxes for missed insects. **Save boxes**
+stores edits for the current session. Then keep, reject, or mark detections
+uncertain, and confirm that every target insect is annotated. Unreviewed or
+uncertain frames are excluded from export; rejected boxes are omitted.
 
 Download the review CSV at any time. Dataset export creates a ready-to-use YOLO
 ZIP containing `images/{train,val,test}`, `labels/{train,val,test}`, and
@@ -142,10 +140,16 @@ frames from one source video stay in one split. At least three videos with
 complete, exportable frames are required to populate train, validation, and test.
 The app never modifies the original dataset or starts training.
 
-Uploads, review decisions, and exports are stored locally under the ignored
-`hard_negative_sessions/` directory. Saved app data is deleted when a fresh
-browser session starts; use **Clear session data now** to remove it sooner.
-On shared/HPC storage, set a private `BEE_MINING_DATA_DIR` before launch.
+Uploads, extracted frames, annotations, and exports are stored in a unique
+temporary directory per session. A browser refresh or new session removes that
+session's files; dataset and preview ZIPs are deleted after their download is
+prepared. CSV reports are generated in memory. Disconnected sessions are removed
+by the periodic cleaner after the configured inactivity lifetime (default 24
+hours; set `BEE_MINING_SESSION_MAX_AGE_HOURS` to change it). Cleanup runs on app
+startup and every 10 minutes while the app process is running. Streamlit cannot
+reliably report browser tab closure or confirm when a download has finished, so
+cleanup uses download initiation and inactivity timeouts. Set
+`BEE_MINING_TMPDIR` to choose a private temporary location on shared/HPC storage.
 OpenCV uses the video-reported FPS for sampling and timestamps; variable-frame-rate
 video timestamps may therefore be approximate.
 

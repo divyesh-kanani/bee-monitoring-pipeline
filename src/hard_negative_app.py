@@ -1,6 +1,8 @@
 """Local Streamlit app for reviewing individual YOLO detections."""
 
 import csv
+import colorsys
+import fcntl
 import hashlib
 import json
 import os
@@ -8,16 +10,21 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import cv2
 import imageio_ffmpeg
 import numpy as np
 import streamlit as st
 import yaml
+from PIL import Image
+from streamlit_drawable_canvas import st_canvas
 from ultralytics import YOLO
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -31,10 +38,8 @@ except Exception:  # pragma: no cover - optional dependency for RF-DETR mode
 
 from hard_negative_mining import DEFAULT_DATA, VIDEO_EXTENSIONS, _read_class_names
 from hard_negative_review import (
-    REVIEW_STATUSES,
     annotated_preview_zip,
     create_dataset,
-    draw_review_image,
     extract_detections,
     frame_bounds,
     preview_frames,
@@ -50,9 +55,20 @@ from tracking.video_utils import draw_tracks
 
 SESSION_ROOT = Path(
     os.environ.get(
-        "BEE_MINING_DATA_DIR", str(PROJECT_ROOT / "hard_negative_sessions")
+        "BEE_MINING_TMPDIR",
+        os.environ.get(
+            "BEE_MINING_DATA_DIR",
+            str(Path(tempfile.gettempdir()) / "bee-monitoring-dashboard"),
+        ),
     )
 ).expanduser()
+SESSION_MAX_AGE_SECONDS = max(
+    60,
+    int(float(os.environ.get("BEE_MINING_SESSION_MAX_AGE_HOURS", "24")) * 3600),
+)
+SESSION_CLEANUP_INTERVAL_SECONDS = max(
+    60, int(os.environ.get("BEE_MINING_CLEANUP_INTERVAL_SECONDS", "600"))
+)
 VIDEO_TYPES = sorted(suffix.lstrip(".") for suffix in VIDEO_EXTENSIONS)
 MODEL_BACKENDS = ["Ultralytics YOLO", "RF-DETR"]
 
@@ -70,8 +86,6 @@ def _session_id() -> str:
         previous_id = st.query_params.get("session")
         if previous_id:
             _clear_session_data(str(previous_id))
-        _clear_other_session_data()
-        _clear_legacy_detection_data()
         st.session_state["_bee_dashboard_initialized"] = True
         session_id = uuid.uuid4().hex
         st.query_params["session"] = session_id
@@ -86,48 +100,105 @@ def _session_id() -> str:
     return session_id
 
 
-def _clear_other_session_data() -> None:
-    if not SESSION_ROOT.is_dir():
-        return
-    for path in SESSION_ROOT.iterdir():
-        if not path.is_dir() or path.is_symlink():
-            continue
-        try:
-            uuid.UUID(path.name)
-        except ValueError:
-            continue
-        shutil.rmtree(path)
-
-
-def _clear_legacy_detection_data() -> None:
-    for path in (
-        SESSION_ROOT / "detection_exports",
-        SESSION_ROOT / "detection_preview",
-    ):
-        if path.is_symlink() or path.is_file():
-            path.unlink(missing_ok=True)
-        elif path.is_dir():
-            shutil.rmtree(path)
-
-
-def _clear_session_data(session_id: str) -> None:
+def _clear_session_data(session_id: str, lock_held: bool = False) -> None:
     try:
-        normalized_id = uuid.UUID(session_id).hex
+        directory = _session_directory(session_id)
     except ValueError:
         return
-    for path in (
-        _session_directory(normalized_id),
-        SESSION_ROOT / "detection_exports" / normalized_id,
-        SESSION_ROOT / "detection_preview" / normalized_id,
-    ):
-        if path.is_symlink() or path.is_file():
-            path.unlink(missing_ok=True)
-        elif path.is_dir():
-            shutil.rmtree(path)
+    if not directory.is_dir() or directory.is_symlink():
+        return
+    if lock_held:
+        shutil.rmtree(directory)
+        return
+    lock_path = directory / ".lock"
+    with lock_path.open("a") as lock_file:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
+        shutil.rmtree(directory)
 
 
 def _session_directory(session_id: str) -> Path:
-    return SESSION_ROOT / session_id
+    return SESSION_ROOT / uuid.UUID(session_id).hex
+
+
+def _touch_session(session_id: str) -> None:
+    directory = _session_directory(session_id)
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / ".activity").touch()
+
+
+@contextmanager
+def _session_access(session_id: str) -> Iterator[None]:
+    directory = _session_directory(session_id)
+    directory.mkdir(parents=True, exist_ok=True)
+    with (directory / ".lock").open("a") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        _touch_session(session_id)
+        try:
+            yield
+        finally:
+            if directory.is_dir():
+                _touch_session(session_id)
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _cleanup_abandoned_sessions(now: float | None = None) -> int:
+    if not SESSION_ROOT.is_dir():
+        return 0
+    current_time = time.time() if now is None else now
+    removed = 0
+    for directory in SESSION_ROOT.iterdir():
+        if not directory.is_dir() or directory.is_symlink():
+            continue
+        try:
+            uuid.UUID(directory.name)
+        except ValueError:
+            continue
+        lock_path = directory / ".lock"
+        with lock_path.open("a") as lock_file:
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                continue
+            activity_path = directory / ".activity"
+            last_active = activity_path.stat().st_mtime if activity_path.exists() else directory.stat().st_mtime
+            if current_time - last_active > SESSION_MAX_AGE_SECONDS:
+                shutil.rmtree(directory)
+                removed += 1
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    return removed
+
+
+@st.cache_resource
+def _start_cleanup_worker() -> threading.Thread:
+    def run() -> None:
+        while True:
+            _cleanup_abandoned_sessions()
+            time.sleep(SESSION_CLEANUP_INTERVAL_SECONDS)
+
+    worker = threading.Thread(target=run, name="bee-session-cleanup", daemon=True)
+    worker.start()
+    return worker
+
+
+def _read_then_delete(path: Path, session_id: str) -> bytes:
+    directory = _session_directory(session_id).resolve()
+    resolved_path = path.resolve()
+    if not resolved_path.is_relative_to(directory):
+        raise ValueError("Download path is outside the current temporary session.")
+    with _session_access(session_id):
+        try:
+            return resolved_path.read_bytes()
+        finally:
+            resolved_path.unlink(missing_ok=True)
+
+
+def _delete_session_artifact(session_id: str, filename: str) -> None:
+    if Path(filename).name != filename:
+        raise ValueError("Invalid temporary artifact name.")
+    (_session_directory(session_id) / filename).unlink(missing_ok=True)
 
 
 def _load_state(session_id: str) -> dict[str, Any]:
@@ -172,50 +243,42 @@ def _store_upload(
     return digest, path
 
 
-def _detection_edits(
-    session_id: str, state: dict[str, Any], detection: dict[str, Any]
-) -> dict[str, Any]:
-    coordinates = {
-        key: float(st.session_state[f"{session_id}:{detection['detection_id']}:{key}"])
-        for key in ("x1", "y1", "x2", "y2")
-    }
-    if (
-        coordinates["x1"] < 0
-        or coordinates["y1"] < 0
-        or coordinates["x2"] > st.session_state["current_frame_width"]
-        or coordinates["y2"] > st.session_state["current_frame_height"]
-        or coordinates["x2"] <= coordinates["x1"]
-        or coordinates["y2"] <= coordinates["y1"]
-    ):
-        raise ValueError("Bounding box must have positive area and stay inside the image.")
-    class_id = int(
-        st.session_state[f"{session_id}:{detection['detection_id']}:class"]
-    )
-    return {
-        **coordinates,
-        "class_id": class_id,
-        "class_name": state["class_names"][class_id],
-    }
-
-
 def _set_detection_status(
     session_id: str,
     state: dict[str, Any],
     detection: dict[str, Any],
     status: str,
 ) -> None:
-    edits = _detection_edits(session_id, state, detection)
-    detection.update(edits)
     detection["history"].append(detection["status"])
     detection["status"] = status
     _save_state(session_id, state)
 
 
-def _update_detection_box(
-    session_id: str, state: dict[str, Any], detection: dict[str, Any]
-) -> None:
-    detection.update(_detection_edits(session_id, state, detection))
-    _save_state(session_id, state)
+def _next_unreviewed_detection(
+    detections: list[dict[str, Any]], current_detection_id: str
+) -> str:
+    if not detections:
+        return ""
+    current_index = next(
+        (
+            index
+            for index, detection in enumerate(detections)
+            if detection["detection_id"] == current_detection_id
+        ),
+        -1,
+    )
+    ordered = detections[current_index + 1 :] + detections[: current_index + 1]
+    return next(
+        (detection["detection_id"] for detection in ordered if detection["status"] == "unreviewed"),
+        current_detection_id,
+    )
+
+
+def _reset_canvas_draft(session_id: str, frame_id: str) -> None:
+    draft_key = f"{session_id}:{frame_id}:canvas_draft"
+    revision_key = f"{session_id}:{frame_id}:canvas_revision"
+    st.session_state.pop(draft_key, None)
+    st.session_state[revision_key] = int(st.session_state.get(revision_key, 0)) + 1
 
 
 def _video_signature(
@@ -468,72 +531,324 @@ def _render_upload_stage(
             st.error(f"Could not process videos ({type(error).__name__}): {error}")
 
 
+def _next_canvas_stroke(used_strokes: set[str]) -> str:
+    index = 0
+    while True:
+        red, green, blue = colorsys.hsv_to_rgb((index * 0.618033988749895) % 1, 0.85, 0.95)
+        color = f"#{round(red * 255):02x}{round(green * 255):02x}{round(blue * 255):02x}"
+        if color.lower() not in used_strokes and color.lower() != "#00a6ff":
+            used_strokes.add(color.lower())
+            return color
+        index += 1
+
+
+def _canvas_drawing(
+    frame: dict[str, Any],
+    canvas_width: int,
+    canvas_height: int,
+    selected_detection_id: str = "",
+) -> tuple[dict[str, Any], dict[str, str], bool]:
+    objects = []
+    detection_by_stroke = {}
+    used_strokes: set[str] = set()
+    changed = False
+    status_indices: dict[str, int] = {}
+    status_hues = {
+        "unreviewed": 0.58,
+        "true_positive": 0.34,
+        "false_positive": 0.0,
+        "uncertain": 0.14,
+    }
+    for detection in frame["detections"]:
+        status = detection["status"]
+        variant = status_indices.get(status, 0)
+        status_indices[status] = variant + 1
+        stroke = str(detection.get("canvas_stroke", "")).lower()
+        if (
+            not stroke
+            or stroke in used_strokes
+            or detection.get("canvas_status") != status
+        ):
+            hue = status_hues.get(status, 0.58)
+            saturation = 0.8 - (variant % 4) * 0.06
+            value = 0.95 - (variant // 4 % 4) * 0.06
+            red, green, blue = colorsys.hsv_to_rgb(hue, saturation, value)
+            stroke = (
+                f"#{round(red * 255):02x}{round(green * 255):02x}"
+                f"{round(blue * 255):02x}"
+            )
+            while stroke in used_strokes:
+                stroke = _next_canvas_stroke(used_strokes)
+            used_strokes.add(stroke)
+            detection["canvas_stroke"] = stroke
+            detection["canvas_status"] = status
+            changed = True
+        else:
+            used_strokes.add(stroke)
+        detection_by_stroke[stroke] = detection["detection_id"]
+        x1, y1, x2, y2 = (float(detection[key]) for key in ("x1", "y1", "x2", "y2"))
+        x_scale = canvas_width / frame["width"]
+        y_scale = canvas_height / frame["height"]
+        objects.append(
+            {
+                "type": "rect",
+                "left": x1 * x_scale,
+                "top": y1 * y_scale,
+                "width": (x2 - x1) * x_scale,
+                "height": (y2 - y1) * y_scale,
+                "scaleX": 1,
+                "scaleY": 1,
+                "angle": 0,
+                "originX": "left",
+                "originY": "top",
+                "fill": "rgba(0,0,0,0)",
+                "stroke": stroke,
+                "strokeWidth": 4
+                if detection["detection_id"] == selected_detection_id
+                else 1,
+                "selectable": True,
+            }
+        )
+    return {"version": "4.4.0", "objects": objects}, detection_by_stroke, changed
+
+
+def _review_image(
+    image: np.ndarray, detections: list[dict[str, Any]], selected_detection_id: str
+) -> np.ndarray:
+    preview = image.copy()
+    colors = {
+        "unreviewed": (255, 190, 0),
+        "true_positive": (45, 190, 45),
+        "false_positive": (45, 45, 225),
+        "uncertain": (0, 210, 255),
+    }
+    for number, detection in enumerate(detections, 1):
+        x1, y1, x2, y2 = (
+            int(round(float(detection[key]))) for key in ("x1", "y1", "x2", "y2")
+        )
+        selected = detection["detection_id"] == selected_detection_id
+        status_color = colors.get(detection["status"], (255, 190, 0))
+        color = (
+            status_color
+            if selected
+            else tuple(round(channel * 0.55) for channel in status_color)
+        )
+        cv2.rectangle(preview, (x1, y1), (x2, y2), color, 4 if selected else 1)
+        label = f"{number} {detection['class_name']} {detection['confidence']:.2f}"
+        label_y = max(20, y1 - 7)
+        cv2.putText(
+            preview,
+            label,
+            (x1, label_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            color,
+            2 if selected else 1,
+            cv2.LINE_AA,
+        )
+    return preview
+
+
+def _canvas_box(
+    shape: dict[str, Any], scale_x: float, scale_y: float, width: int, height: int
+) -> dict[str, float]:
+    values = [
+        float(shape.get("left", 0)),
+        float(shape.get("top", 0)),
+        float(shape.get("width", 0)),
+        float(shape.get("height", 0)),
+        float(shape.get("scaleX", 1)),
+        float(shape.get("scaleY", 1)),
+        float(shape.get("angle", 0)),
+    ]
+    if not all(np.isfinite(value) for value in values):
+        raise ValueError("A drawn box has non-finite coordinates.")
+    left, top, raw_width, raw_height, scale_width, scale_height, angle = values
+    box_width = abs(raw_width * scale_width)
+    box_height = abs(raw_height * scale_height)
+    center_x = left + box_width / 2
+    center_y = top + box_height / 2
+    radians = np.deg2rad(angle)
+    rotated_width = abs(box_width * np.cos(radians)) + abs(box_height * np.sin(radians))
+    rotated_height = abs(box_width * np.sin(radians)) + abs(box_height * np.cos(radians))
+    x1 = max(0.0, min(float(width), (center_x - rotated_width / 2) * scale_x))
+    y1 = max(0.0, min(float(height), (center_y - rotated_height / 2) * scale_y))
+    x2 = max(0.0, min(float(width), (center_x + rotated_width / 2) * scale_x))
+    y2 = max(0.0, min(float(height), (center_y + rotated_height / 2) * scale_y))
+    if x2 - x1 < 1 or y2 - y1 < 1:
+        raise ValueError("Every box must be at least one original-image pixel wide and high.")
+    return {"x1": x1, "y1": y1, "x2": x2, "y2": y2}
+
+
+def _prepare_canvas_component() -> None:
+    import streamlit.elements.image as streamlit_image
+
+    if hasattr(streamlit_image, "image_to_url"):
+        return
+
+    from streamlit.elements.lib.image_utils import image_to_url
+    from streamlit.elements.lib.layout_utils import LayoutConfig
+
+    def image_to_url_compat(
+        image: Any,
+        width: int,
+        clamp: bool,
+        channels: str,
+        output_format: str,
+        image_id: str,
+    ) -> str:
+        return image_to_url(
+            image,
+            LayoutConfig(width=width),
+            clamp,
+            channels,
+            output_format,
+            image_id,
+        )
+
+    streamlit_image.image_to_url = image_to_url_compat
+
+
+def _save_canvas_annotations(
+    frame: dict[str, Any],
+    shapes: list[dict[str, Any]],
+    detection_by_stroke: dict[str, str],
+    class_by_stroke: dict[str, int],
+    scale_x: float,
+    scale_y: float,
+    class_names: list[str],
+) -> None:
+    live_strokes = set()
+    existing = {detection["detection_id"]: detection for detection in frame["detections"]}
+    manual_count = sum(bool(detection.get("manual")) for detection in frame["detections"])
+    for shape in shapes:
+        if shape.get("type") != "rect":
+            continue
+        stroke = str(shape.get("stroke", "")).lower()
+        class_id = class_by_stroke.get(stroke)
+        if class_id is None or not 0 <= int(class_id) < len(class_names):
+            raise ValueError("Select a valid class for every drawn box.")
+        box = _canvas_box(shape, scale_x, scale_y, frame["width"], frame["height"])
+        detection_id = detection_by_stroke.get(stroke)
+        if detection_id:
+            detection = existing[detection_id]
+            detection.update(box, class_id=int(class_id), class_name=class_names[int(class_id)])
+        else:
+            manual_count += 1
+            detection_id = f"{frame['frame_id']}-manual{manual_count:03d}"
+            while detection_id in existing:
+                manual_count += 1
+                detection_id = f"{frame['frame_id']}-manual{manual_count:03d}"
+            detection = {
+                "detection_id": detection_id,
+                **box,
+                "class_id": int(class_id),
+                "class_name": class_names[int(class_id)],
+                "predicted_class_id": "",
+                "predicted_class": "manual annotation",
+                "confidence": 0.0,
+                "status": "true_positive",
+                "manual": True,
+                "history": [],
+                "canvas_stroke": stroke,
+            }
+            frame["detections"].append(detection)
+            existing[detection_id] = detection
+        live_strokes.add(stroke)
+
+    deleted_manual_ids = set()
+    for stroke, detection_id in detection_by_stroke.items():
+        if stroke in live_strokes:
+            continue
+        detection = existing[detection_id]
+        if detection.get("manual"):
+            deleted_manual_ids.add(detection_id)
+        elif detection["status"] != "false_positive":
+            detection["history"].append(detection["status"])
+            detection["status"] = "false_positive"
+    if deleted_manual_ids:
+        frame["detections"] = [
+            detection
+            for detection in frame["detections"]
+            if detection["detection_id"] not in deleted_manual_ids
+        ]
+    frame["annotation_complete"] = False
+
+
 def _render_review_stage(session_id: str, state: dict[str, Any]) -> None:
     st.header("B · Review individual detections")
     frames = state["frames"]
-    detections = [detection for frame in frames for detection in frame["detections"]]
-    if not detections:
+    if not frames:
         st.info("Run detection first. Only frames containing model detections are saved for review.")
         return
 
-    status_counts = {
-        status: sum(detection["status"] == status for detection in detections)
-        for status in REVIEW_STATUSES
-    }
-    reviewed_count = len(detections) - status_counts["unreviewed"]
-    st.progress(
-        reviewed_count / len(detections),
-        text=f"{reviewed_count} of {len(detections)} detections reviewed",
-    )
-    metric_columns = st.columns(4)
-    for column, status in zip(
-        metric_columns, ("unreviewed", "true_positive", "false_positive", "uncertain")
-    ):
-        column.metric(status.replace("_", " ").title(), status_counts[status])
-    filter_status = st.selectbox(
-        "Filter frames by detection status",
-        ("all", "unreviewed", "true_positive", "false_positive", "uncertain"),
-        format_func=lambda value: value.replace("_", " ").title(),
-        key=f"{session_id}:review_filter",
-    )
-    filtered_frames = [
-        frame
-        for frame in frames
-        if filter_status == "all"
-        or any(detection["status"] == filter_status for detection in frame["detections"])
-    ]
-    if not filtered_frames:
-        st.info("No frames match this review filter.")
-        return
-
     current_key = f"{session_id}:current_frame"
-    frame_options = [frame["frame_id"] for frame in filtered_frames]
+    frame_options = [frame["frame_id"] for frame in frames]
     if st.session_state.get(current_key) not in frame_options:
         st.session_state[current_key] = frame_options[0]
     frame_index = frame_options.index(st.session_state[current_key])
-    navigation = st.columns([1, 4, 1])
-    if navigation[0].button("← Previous", disabled=frame_index == 0, key=f"{session_id}:previous"):
+    reviewed_frames = sum(
+        bool(frame["detections"])
+        and all(
+            detection["status"] in {"true_positive", "false_positive"}
+            for detection in frame["detections"]
+        )
+        for frame in frames
+    )
+    remaining_frames = len(frames) - reviewed_frames
+    st.progress(
+        reviewed_frames / len(frames),
+        text=f"{reviewed_frames}/{len(frames)} frames reviewed · "
+        f"{remaining_frames} remaining",
+    )
+
+    navigation = st.columns(4)
+    if navigation[0].button(
+        "← Previous frame", disabled=frame_index == 0, key=f"{session_id}:previous"
+    ):
         st.session_state[current_key] = frame_options[frame_index - 1]
         st.rerun()
-    navigation[2].markdown(f"**Frame {frame_index + 1} of {len(frame_options)}**")
-    if navigation[2].button(
-        "Next →", disabled=frame_index + 1 >= len(frame_options), key=f"{session_id}:next"
+    if navigation[1].button(
+        "Previous unreviewed",
+        disabled=not any(
+            any(detection["status"] == "unreviewed" for detection in candidate["detections"])
+            for candidate in frames[:frame_index]
+        ),
+        key=f"{session_id}:previous_unreviewed",
+    ):
+        candidates = [
+            index
+            for index, candidate in enumerate(frames[:frame_index])
+            if any(detection["status"] == "unreviewed" for detection in candidate["detections"])
+        ]
+        st.session_state[current_key] = frame_options[candidates[-1]]
+        st.rerun()
+    navigation[2].markdown(f"**Frame {frame_index + 1}/{len(frames)}**")
+    if navigation[3].button(
+        "Next frame →",
+        disabled=frame_index + 1 >= len(frame_options),
+        key=f"{session_id}:next",
     ):
         st.session_state[current_key] = frame_options[frame_index + 1]
         st.rerun()
-    selected_frame_id = st.selectbox(
-        "Frame",
-        frame_options,
-        index=frame_index,
-        format_func=lambda value: next(
-            f"{frame['video_filename']} · frame {frame['frame_number']} · "
-            f"{frame['timestamp_seconds']:.2f}s"
-            for frame in filtered_frames
-            if frame["frame_id"] == value
+    next_unreviewed_col = st.columns([1, 3])[0]
+    if next_unreviewed_col.button(
+        "Next unreviewed frame",
+        disabled=not any(
+            any(detection["status"] == "unreviewed" for detection in candidate["detections"])
+            for candidate in frames[frame_index + 1 :]
         ),
-        key=current_key,
-    )
-    frame = next(frame for frame in frames if frame["frame_id"] == selected_frame_id)
+        key=f"{session_id}:next_unreviewed",
+    ):
+        candidates = [
+            index
+            for index, candidate in enumerate(frames[frame_index + 1 :], frame_index + 1)
+            if any(detection["status"] == "unreviewed" for detection in candidate["detections"])
+        ]
+        st.session_state[current_key] = frame_options[candidates[0]]
+        st.rerun()
+
+    frame = frames[frame_index]
     image = cv2.imread(frame["image_path"])
     if image is None:
         st.error(f"Could not read saved frame: {frame['image_path']}")
@@ -541,148 +856,305 @@ def _render_review_stage(session_id: str, state: dict[str, Any]) -> None:
 
     class_names = state["class_names"]
     frame["width"], frame["height"] = image.shape[1], image.shape[0]
-    st.session_state["current_frame_width"] = frame["width"]
-    st.session_state["current_frame_height"] = frame["height"]
-    if frame["detections"]:
-        detection_labels = {
-            detection["detection_id"]: (
-                f"{detection['detection_id']} · {detection['class_name']} · "
-                f"{detection['confidence']:.2f} · {detection['status'].replace('_', ' ')}"
-            )
-            for detection in frame["detections"]
-        }
-        detection_id = st.selectbox(
-            "Select one detection (the selected box is highlighted)",
-            list(detection_labels),
-            format_func=lambda value: detection_labels[value],
-            key=f"{session_id}:{frame['frame_id']}:detection",
+    detections = frame["detections"]
+    detection_key = f"{session_id}:{frame['frame_id']}:selected_detection"
+    detection_ids = [detection["detection_id"] for detection in detections]
+    if st.session_state.get(detection_key) not in detection_ids:
+        st.session_state[detection_key] = next(
+            (
+                detection["detection_id"]
+                for detection in detections
+                if detection["status"] == "unreviewed"
+            ),
+            detection_ids[0] if detection_ids else "",
         )
-        selected_detection = next(
-            detection
-            for detection in frame["detections"]
-            if detection["detection_id"] == detection_id
-        )
-    else:
-        selected_detection = None
+    detection_id = st.session_state[detection_key]
+    selected_detection = next(
+        (detection for detection in detections if detection["detection_id"] == detection_id),
+        None,
+    )
 
-    original_column, annotated_column = st.columns(2)
-    original_column.image(
-        cv2.cvtColor(image, cv2.COLOR_BGR2RGB),
-        caption="Original frame",
-        width="stretch",
+    selected_count = sum(detection["status"] != "unreviewed" for detection in detections)
+    st.progress(
+        selected_count / len(detections) if detections else 1.0,
+        text=f"{selected_count}/{len(detections)} detections reviewed in this frame",
     )
-    annotated_image = draw_review_image(
-        image, frame["detections"], selected_detection["detection_id"] if selected_detection else ""
+    if detections:
+        with st.expander("Select a detection", expanded=False):
+            number_columns = st.columns(8)
+            symbols = {
+                "unreviewed": "○",
+                "true_positive": "✓",
+                "false_positive": "×",
+                "uncertain": "?",
+            }
+            for number, detection in enumerate(detections, 1):
+                if number_columns[(number - 1) % len(number_columns)].button(
+                    f"{number} {symbols.get(detection['status'], '○')}",
+                    key=f"{session_id}:{frame['frame_id']}:select:{detection['detection_id']}",
+                    type="primary" if detection["detection_id"] == detection_id else "secondary",
+                    help=f"{detection['class_name']} · {detection['status'].replace('_', ' ')}",
+                ):
+                    st.session_state[detection_key] = detection["detection_id"]
+                    _reset_canvas_draft(session_id, frame["frame_id"])
+                    st.rerun()
+
+    image_height, image_width = image.shape[:2]
+    display_scale = min(1.0, 1000 / image_width, 700 / image_height)
+    canvas_width = max(1, round(image_width * display_scale))
+    canvas_height = max(1, round(image_height * display_scale))
+    scale_x = image_width / canvas_width
+    scale_y = image_height / canvas_height
+    initial_drawing, detection_by_stroke, drawing_changed = _canvas_drawing(
+        frame,
+        canvas_width,
+        canvas_height,
+        detection_id,
     )
-    annotated_column.image(
-        cv2.cvtColor(annotated_image, cv2.COLOR_BGR2RGB),
-        caption="Green: accepted · red: rejected · orange: uncertain · gray: unreviewed · cyan: selected",
-        width="stretch",
+    if drawing_changed:
+        _save_state(session_id, state)
+    numbered_image = _review_image(image, detections, detection_id)
+    display_image = Image.fromarray(cv2.cvtColor(numbered_image, cv2.COLOR_BGR2RGB)).resize(
+        (canvas_width, canvas_height), Image.Resampling.LANCZOS
     )
+    drawing_mode_key = f"{session_id}:{frame['frame_id']}:draw_mode"
+    if drawing_mode_key not in st.session_state:
+        st.session_state[drawing_mode_key] = "edit"
+    tool_columns = st.columns([1, 1, 4])
+    if tool_columns[0].button("＋ Add insect", key=f"{session_id}:{frame['frame_id']}:add_insect"):
+        st.session_state[drawing_mode_key] = "add"
+        _reset_canvas_draft(session_id, frame["frame_id"])
+        st.rerun()
+    if tool_columns[1].button("Edit boxes", key=f"{session_id}:{frame['frame_id']}:edit_boxes"):
+        st.session_state[drawing_mode_key] = "edit"
+        _reset_canvas_draft(session_id, frame["frame_id"])
+        st.rerun()
+    drawing_mode_label = st.session_state[drawing_mode_key]
+    draft_key = f"{session_id}:{frame['frame_id']}:canvas_draft"
+    revision_key = f"{session_id}:{frame['frame_id']}:canvas_revision"
+    revision = int(st.session_state.get(revision_key, 0))
+    previous_drawing = st.session_state.get(draft_key)
+    drawing = previous_drawing if isinstance(previous_drawing, dict) else initial_drawing
+    for shape in drawing.get("objects", []):
+        if not isinstance(shape, dict):
+            continue
+        shape["strokeWidth"] = (
+            4
+            if detection_by_stroke.get(str(shape.get("stroke", "")).lower())
+            == (selected_detection["detection_id"] if selected_detection else "")
+            else 2
+        )
+    previous_strokes = {
+        str(shape.get("stroke", "")).lower()
+        for shape in drawing.get("objects", [])
+        if isinstance(shape, dict)
+    }
+
+    _prepare_canvas_component()
+    canvas_result = st_canvas(
+        fill_color="rgba(0, 166, 255, 0.08)",
+        stroke_width=3,
+        stroke_color="#00A6FF",
+        background_image=display_image,
+        width=canvas_width,
+        height=canvas_height,
+        drawing_mode="rect" if drawing_mode_label == "add" else "transform",
+        initial_drawing=drawing,
+        update_streamlit=True,
+        display_toolbar=False,
+        key=f"{session_id}:{frame['frame_id']}:canvas:{revision}",
+    )
+
+    result_drawing = getattr(canvas_result, "json_data", None)
+    if not isinstance(result_drawing, dict):
+        result_drawing = drawing
+    result_drawing.setdefault("objects", [])
+    assigned_new_id = False
+    used_strokes = set(detection_by_stroke) | previous_strokes
+    for shape in result_drawing["objects"]:
+        if not isinstance(shape, dict) or shape.get("type") != "rect":
+            continue
+        stroke = str(shape.get("stroke", "")).lower()
+        if stroke not in detection_by_stroke and stroke not in previous_strokes:
+            shape["stroke"] = _next_canvas_stroke(used_strokes)
+            assigned_new_id = True
+    st.session_state[draft_key] = result_drawing
+    if assigned_new_id:
+        st.session_state[revision_key] = revision + 1
+        st.rerun()
+
+    shapes = [
+        shape
+        for shape in result_drawing.get("objects", [])
+        if isinstance(shape, dict) and shape.get("type") == "rect"
+    ]
+    class_by_stroke: dict[str, int] = {}
+    detection_lookup = {
+        detection["detection_id"]: detection for detection in frame["detections"]
+    }
+    new_strokes = []
+    for shape in shapes:
+        stroke = str(shape.get("stroke", "")).lower()
+        detection_id = detection_by_stroke.get(stroke)
+        if detection_id:
+            detection = detection_lookup[detection_id]
+            class_by_stroke[stroke] = int(detection["class_id"])
+        else:
+            new_strokes.append(stroke)
+    if new_strokes:
+        new_class_id = int(
+            st.selectbox(
+                "Class for added insects",
+                range(len(class_names)),
+                index=(
+                    int(selected_detection["class_id"])
+                    if selected_detection and selected_detection["class_id"] < len(class_names)
+                    else 0
+                ),
+                format_func=lambda value: f"{value}: {class_names[value]}",
+                key=f"{session_id}:{frame['frame_id']}:new_class",
+            )
+        )
+        for stroke in new_strokes:
+            class_by_stroke[stroke] = new_class_id
+    if drawing_mode_label == "add":
+        st.caption("Draw one or more rectangles on the image, then save them as true-positive annotations.")
+    if st.button(
+        "Save boxes",
+        type="primary",
+        key=f"{session_id}:{frame['frame_id']}:save_boxes",
+        disabled=not shapes,
+    ):
+        try:
+            _save_canvas_annotations(
+                frame,
+                result_drawing["objects"],
+                detection_by_stroke,
+                class_by_stroke,
+                scale_x,
+                scale_y,
+                class_names,
+            )
+            _save_state(session_id, state)
+            st.session_state.pop(draft_key, None)
+            st.session_state[revision_key] = revision + 1
+            st.session_state[drawing_mode_key] = "edit"
+            st.rerun()
+        except (KeyError, TypeError, ValueError) as error:
+            st.error(f"Could not save these boxes: {error}")
 
     if selected_detection is not None:
-        st.subheader(f"Detection {selected_detection['detection_id']}")
+        detection_number = detection_ids.index(selected_detection["detection_id"]) + 1
+        st.subheader(f"Detection {detection_number}")
         st.caption(
-            f"Predicted: {selected_detection['class_name']} · "
-            f"Confidence: {selected_detection['confidence']:.3f}"
+            f"{'Manually added' if selected_detection.get('manual') else 'Predicted'} · "
+            f"{selected_detection.get('predicted_class', selected_detection['class_name'])} · "
+            f"confidence {selected_detection['confidence']:.3f} · "
+            f"{selected_detection['status'].replace('_', ' ')}"
         )
-        box_columns = st.columns(4)
-        for column, coordinate in zip(box_columns, ("x1", "y1", "x2", "y2")):
-            column.number_input(
-                coordinate,
-                min_value=0.0,
-                max_value=float(frame["width"] if coordinate in {"x1", "x2"} else frame["height"]),
-                value=float(selected_detection[coordinate]),
-                step=1.0,
-                key=f"{session_id}:{detection_id}:{coordinate}",
-            )
-        class_index = selected_detection["class_id"]
-        st.selectbox(
-            "Correct class",
+        selected_class_id = st.selectbox(
+            "Selected box class",
             range(len(class_names)),
-            index=class_index,
+            index=int(selected_detection["class_id"]),
             format_func=lambda value: f"{value}: {class_names[value]}",
-            key=f"{session_id}:{detection_id}:class",
+            key=f"{session_id}:{frame['frame_id']}:selected_class:{detection_id}",
         )
-        decision_columns = st.columns(5)
+        if selected_class_id != selected_detection["class_id"]:
+            selected_detection["class_id"] = selected_class_id
+            selected_detection["class_name"] = class_names[selected_class_id]
+            frame["annotation_complete"] = False
+            _save_state(session_id, state)
+            _reset_canvas_draft(session_id, frame["frame_id"])
+            st.rerun()
+
+        detection_position = detection_ids.index(detection_id)
+        decision_columns = st.columns(7)
         try:
             if decision_columns[0].button("Keep detection", key=f"{session_id}:{detection_id}:keep"):
                 _set_detection_status(session_id, state, selected_detection, "true_positive")
+                st.session_state[detection_key] = _next_unreviewed_detection(
+                    detections, detection_id
+                )
+                _reset_canvas_draft(session_id, frame["frame_id"])
                 st.rerun()
             if decision_columns[1].button("Reject detection", key=f"{session_id}:{detection_id}:reject"):
                 _set_detection_status(session_id, state, selected_detection, "false_positive")
+                st.session_state[detection_key] = _next_unreviewed_detection(
+                    detections, detection_id
+                )
+                _reset_canvas_draft(session_id, frame["frame_id"])
                 st.rerun()
             if decision_columns[2].button("Mark uncertain", key=f"{session_id}:{detection_id}:uncertain"):
                 _set_detection_status(session_id, state, selected_detection, "uncertain")
+                st.session_state[detection_key] = _next_unreviewed_detection(
+                    detections, detection_id
+                )
+                _reset_canvas_draft(session_id, frame["frame_id"])
                 st.rerun()
-            if decision_columns[3].button("Save box correction", key=f"{session_id}:{detection_id}:save"):
-                _update_detection_box(session_id, state, selected_detection)
-                st.success("Bounding box and class saved.")
-            if decision_columns[4].button(
+            if decision_columns[3].button(
                 "Undo decision",
                 disabled=not selected_detection["history"],
                 key=f"{session_id}:{detection_id}:undo",
             ):
                 selected_detection["status"] = selected_detection["history"].pop()
                 _save_state(session_id, state)
+                _reset_canvas_draft(session_id, frame["frame_id"])
+                st.rerun()
+            if decision_columns[4].button(
+                "← Previous",
+                disabled=detection_position == 0,
+                key=f"{session_id}:{detection_id}:previous_detection",
+            ):
+                st.session_state[detection_key] = detection_ids[detection_position - 1]
+                _reset_canvas_draft(session_id, frame["frame_id"])
+                st.rerun()
+            if decision_columns[5].button(
+                "Next →",
+                disabled=detection_position + 1 >= len(detection_ids),
+                key=f"{session_id}:{detection_id}:next_detection",
+            ):
+                st.session_state[detection_key] = detection_ids[detection_position + 1]
+                _reset_canvas_draft(session_id, frame["frame_id"])
+                st.rerun()
+            if decision_columns[6].button(
+                "Delete box",
+                key=f"{session_id}:{detection_id}:delete_detection",
+            ):
+                frame["detections"] = [
+                    detection
+                    for detection in frame["detections"]
+                    if detection["detection_id"] != detection_id
+                ]
+                remaining_ids = [
+                    detection["detection_id"] for detection in frame["detections"]
+                ]
+                st.session_state[detection_key] = next(
+                    (
+                        detection["detection_id"]
+                        for detection in frame["detections"]
+                        if detection["status"] == "unreviewed"
+                    ),
+                    remaining_ids[0] if remaining_ids else "",
+                )
+                frame["annotation_complete"] = False
+                _save_state(session_id, state)
+                _reset_canvas_draft(session_id, frame["frame_id"])
                 st.rerun()
         except (KeyError, ValueError) as error:
             st.error(f"Could not save this detection: {error}")
 
-    with st.expander("Add a missed insect"):
-        st.caption("Draw a box by entering pixel coordinates and select the correct class.")
-        with st.form(f"{session_id}:{frame['frame_id']}:add_detection"):
-            add_columns = st.columns(5)
-            x1 = add_columns[0].number_input("x1", 0.0, float(frame["width"]), float(frame["width"] * 0.25))
-            y1 = add_columns[1].number_input("y1", 0.0, float(frame["height"]), float(frame["height"] * 0.25))
-            x2 = add_columns[2].number_input("x2", 0.0, float(frame["width"]), float(frame["width"] * 0.75))
-            y2 = add_columns[3].number_input("y2", 0.0, float(frame["height"]), float(frame["height"] * 0.75))
-            class_id = add_columns[4].selectbox(
-                "Class",
-                range(len(class_names)),
-                format_func=lambda value: f"{value}: {class_names[value]}",
-                key=f"{session_id}:{frame['frame_id']}:new_class",
-            )
-            add_submitted = st.form_submit_button("Add missed insect")
-        if add_submitted:
-            if x2 <= x1 or y2 <= y1:
-                st.error("Bounding box must have positive width and height.")
-            else:
-                detection_id = f"{frame['frame_id']}-manual{sum(bool(d['manual']) for d in frame['detections']) + 1:03d}"
-                frame["detections"].append(
-                    {
-                        "detection_id": detection_id,
-                        "class_id": class_id,
-                        "class_name": class_names[class_id],
-                        "predicted_class_id": "",
-                        "predicted_class": "manual annotation",
-                        "confidence": 0.0,
-                        "x1": x1,
-                        "y1": y1,
-                        "x2": x2,
-                        "y2": y2,
-                        "status": "true_positive",
-                        "manual": True,
-                        "history": [],
-                    }
-                )
-                frame["annotation_complete"] = False
-                _save_state(session_id, state)
-                st.rerun()
-
     completeness_key = f"{session_id}:{frame['frame_id']}:complete"
-    st.checkbox(
-        "I checked the entire frame; every target insect is annotated.",
+    complete = st.checkbox(
+        "I have checked the entire frame; all target insects are annotated.",
         value=bool(frame["annotation_complete"]),
         key=completeness_key,
         help="Required before export. This prevents a frame with a missed insect from becoming a false negative.",
     )
-    if st.button("Save frame completeness", key=f"{session_id}:{frame['frame_id']}:save_complete"):
-        frame["annotation_complete"] = bool(st.session_state[completeness_key])
+    if bool(complete) != bool(frame["annotation_complete"]):
+        frame["annotation_complete"] = bool(complete)
         _save_state(session_id, state)
-        st.rerun()
-    if any(detection["status"] in {"unreviewed", "uncertain"} for detection in frame["detections"]):
-        st.warning("This frame cannot be exported until every detection is reviewed; uncertain detections exclude it.")
+    if any(detection["status"] in {"unreviewed", "uncertain"} for detection in detections):
+        st.warning("Resolve every detection, including uncertain ones, before this frame can be exported.")
 
 
 def _render_export_stage(session_id: str, state: dict[str, Any], data_path: Path) -> None:
@@ -722,6 +1194,8 @@ def _render_export_stage(session_id: str, state: dict[str, Any], data_path: Path
         file_name="review_report.csv",
         mime="text/csv",
         key=f"{session_id}:download_csv",
+        on_click=_delete_session_artifact,
+        args=(session_id, "review_report.csv"),
     )
     if st.button("Prepare optional annotated-preview ZIP", key=f"{session_id}:make_previews"):
         preview_path = _session_directory(session_id) / "annotated_previews.zip"
@@ -736,7 +1210,7 @@ def _render_export_stage(session_id: str, state: dict[str, Any], data_path: Path
     if preview_path.is_file():
         st.download_button(
             "Download annotated preview images (.zip)",
-            data=preview_path.read_bytes(),
+            data=lambda path=preview_path, sid=session_id: _read_then_delete(path, sid),
             file_name="annotated_previews.zip",
             mime="application/zip",
             key=f"{session_id}:download_previews",
@@ -744,29 +1218,29 @@ def _render_export_stage(session_id: str, state: dict[str, Any], data_path: Path
 
     if st.button("Generate reviewed YOLO dataset", type="primary", key=f"{session_id}:export"):
         export_root = _session_directory(session_id) / f"dataset_export_{uuid.uuid4().hex[:8]}"
+        zip_path = export_root.with_suffix(".zip")
         try:
             dataset_dir, split_counts = create_dataset(
                 frames, class_names, export_root, seed=42
             )
-            zip_path = zip_directory(dataset_dir, export_root.with_suffix(".zip"))
-            csv_path = _session_directory(session_id) / "review_report.csv"
-            csv_path.write_bytes(report_csv(frames))
+            zip_path = zip_directory(dataset_dir, zip_path)
+            shutil.rmtree(dataset_dir)
             state["exports"] = {
                 "dataset_zip": str(zip_path),
-                "report_csv": str(csv_path),
-                "dataset_dir": str(dataset_dir),
             }
             _save_state(session_id, state)
             st.success(f"Dataset created: {split_counts}")
             st.rerun()
         except (OSError, ValueError, yaml.YAMLError) as error:
+            shutil.rmtree(export_root, ignore_errors=True)
+            zip_path.unlink(missing_ok=True)
             st.error(f"Could not create dataset: {error}")
 
     exports = state.get("exports", {})
     if Path(exports.get("dataset_zip", "")).is_file():
         st.download_button(
             "Download complete YOLO dataset (.zip)",
-            data=Path(exports["dataset_zip"]).read_bytes(),
+            data=lambda path=Path(exports["dataset_zip"]), sid=session_id: _read_then_delete(path, sid),
             file_name="dataset_export.zip",
             mime="application/zip",
             key=f"{session_id}:download_dataset",
@@ -1441,8 +1915,13 @@ def main() -> None:
     st.set_page_config(page_title="Bee monitoring dashboard", page_icon="🐝", layout="wide")
     st.title("🐝 Bee monitoring dashboard")
     st.caption("Unified detection and hard-negative review for bee monitoring videos.")
-
+    _start_cleanup_worker()
     session_id = _session_id()
+    with _session_access(session_id):
+        _render_dashboard(session_id)
+
+
+def _render_dashboard(session_id: str) -> None:
     try:
         state = _load_state(session_id)
     except ValueError as error:
@@ -1450,11 +1929,12 @@ def main() -> None:
         st.stop()
 
     with st.sidebar:
-        st.caption("Saved app data is cleared on refresh. Use a private BEE_MINING_DATA_DIR on shared/HPC storage.")
+        st.caption(
+            "Temporary session data is cleared on refresh or expiry. "
+            "Use a private BEE_MINING_TMPDIR on shared/HPC storage."
+        )
         if st.button("Clear session data now", key=f"{session_id}:clear_session"):
-            _clear_session_data(session_id)
-            _clear_other_session_data()
-            _clear_legacy_detection_data()
+            _clear_session_data(session_id, lock_held=True)
             st.session_state.pop("detection_outputs", None)
             st.query_params["session"] = uuid.uuid4().hex
             st.rerun()
@@ -1486,8 +1966,8 @@ def main() -> None:
     )
     with st.expander("About saved sessions and video timing"):
         st.write(
-            f"Review decisions are saved locally in `{SESSION_ROOT}` and can be resumed "
-            "using this browser URL. Uploaded media and exports are not added to Git."
+            f"Temporary uploads, frames, decisions, and exports are kept in `{SESSION_ROOT}` "
+            "for this browser session only."
         )
         st.write(
             "OpenCV uses the video-reported FPS for seeking and timestamps. Variable-frame-rate "
